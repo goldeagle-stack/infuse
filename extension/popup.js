@@ -130,12 +130,20 @@ document.addEventListener('DOMContentLoaded', () => {
     }
 
     /* ---------- disconnect ----------
-       Clears the stored code, which stops the extension from talking
-       to the relay. Saved rules are untouched and keep working. */
+       Puts the page back exactly as it was, forgets the live session and
+       deletes that page's stored rule, so a refresh brings nothing back.
+       Only already-executed JS cannot be taken back — a reload clears that. */
     function disconnect() {
-        chrome.runtime.sendMessage({ type: 'setCode', code: '', tabId: null }, () => {
+        disconnectBtn.disabled = true;
+        disconnectBtn.textContent = 'Clearing…';
+
+        chrome.runtime.sendMessage({ type: 'disconnectAndWipe' }, (res) => {
+            disconnectBtn.disabled = false;
+            disconnectBtn.textContent = 'Disconnect';
             codeInput.value = '';
-            setStatus(false, 'Disconnected');
+            setStatus(false, res && res.rulesDeleted
+                ? 'Disconnected — page cleared'
+                : 'Disconnected');
             codeInput.focus();
         });
     }

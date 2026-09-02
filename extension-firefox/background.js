@@ -14,7 +14,44 @@
      (inside 'apply'), and comes back as xpathRuleResolved
    ============================================================ */
 
-const RELAY_URL = 'wss://infuse-production-d6d4.up.railway.app'; // TODO: swap for the public Railway URL when you deploy
+/* Where the relay lives.
+
+   The editor page works this out on its own — it is served by the
+   very server it talks to. The extension has no such page to look at, so
+   rather than one hard-coded address it tries both, LOCAL FIRST, and
+   remembers whichever answered. Running "npm start" in relay-server/ is
+   then enough to test locally: nothing to edit here, nothing to switch back.
+
+   Both addresses must also be listed in manifest.json under connect-src,
+   or the CSP blocks the socket before it is ever opened. */
+const RELAY_URLS = [
+    'ws://127.0.0.1:8080',                          // relay-server on this machine
+    'wss://infuse-production-d6d4.up.railway.app',  // the deployed one
+];
+
+// which address the next attempt uses; a failed attempt moves to the next
+let relayIndex = 0;
+let relayPreferenceLoaded = false;
+
+function currentRelayUrl() {
+    return RELAY_URLS[relayIndex % RELAY_URLS.length];
+}
+
+function nextRelayUrl() {
+    relayIndex = (relayIndex + 1) % RELAY_URLS.length;
+}
+
+/* Start where we left off, so the usual case connects on the first try
+   instead of always failing over one address before it gets there. */
+async function loadRelayPreference() {
+    if (relayPreferenceLoaded) return;
+    relayPreferenceLoaded = true;
+    try {
+        const { lastRelayUrl } = await chrome.storage.local.get('lastRelayUrl');
+        const i = RELAY_URLS.indexOf(lastRelayUrl);
+        if (i !== -1) relayIndex = i;
+    } catch {}
+}
 // NOTE: 127.0.0.1 instead of "localhost" — some browsers (e.g. Firefox) resolve
 // "localhost" to ::1 (IPv6) while the server listens on IPv4 only, which breaks the connection
 
@@ -404,6 +441,13 @@ function replaceRulesInjector(rules) {
 
             // write ONLY if it really changed (never disturb the DOM for nothing)
             if (text !== original) {
+                // remember what it said, so Disconnect can put it back
+                if (!window.__liveEditorReplaceOriginals) {
+                    window.__liveEditorReplaceOriginals = new Map();
+                }
+                if (!window.__liveEditorReplaceOriginals.has(node)) {
+                    window.__liveEditorReplaceOriginals.set(node, original);
+                }
                 node.textContent = text;
             }
         }
@@ -416,6 +460,86 @@ function replaceRulesInjector(rules) {
     const observer = new MutationObserver(replaceInPage);
     observer.observe(document.body, { childList: true, subtree: true });
     window.__liveEditorReplaceObserver = observer;
+}
+
+/* ---------- Undo everything replaceRulesInjector() did ----------
+   Runs in the page's MAIN world, exactly like the injector itself, so it
+   can reach the same window and the same observer. Must be self-contained.
+   ---------------------------------------------------------------- */
+function replaceRevertInjector() {
+    if (window.__liveEditorReplaceObserver) {
+        try {
+            window.__liveEditorReplaceObserver.disconnect();
+        } catch (e) {}
+        window.__liveEditorReplaceObserver = null;
+    }
+
+    const originals = window.__liveEditorReplaceOriginals;
+    if (originals) {
+        originals.forEach((was, node) => {
+            try {
+                if (node.isConnected) node.textContent = was;
+            } catch (e) {}
+        });
+        originals.clear();
+        window.__liveEditorReplaceOriginals = null;
+    }
+}
+
+/* ---------- Disconnect — leave the page exactly as it was ----------
+   Reverts every change on the target page, forgets the live session, and
+   deletes that page's stored rule — so a refresh brings nothing back.
+
+   The injected JS is the only thing that cannot be taken back: code that
+   has already run stays run. Everything it wrote to the DOM is undone,
+   and it is never injected again.
+   ---------------------------------------------------------------- */
+async function disconnectAndWipe() {
+    const tabId = await getTargetTabId();
+    let url = '';
+
+    if (tabId !== null && tabId !== undefined) {
+        try {
+            const tab = await chrome.tabs.get(tabId);
+            url = tab?.url || '';
+        } catch {}
+
+        // 1) put the page back
+        try {
+            await sendToTab(tabId, { type: 'revertAll' });
+        } catch {}
+
+        try {
+            await chrome.scripting.executeScript({
+                target: { tabId },
+                world: 'MAIN',
+                func: replaceRevertInjector,
+            });
+        } catch {}
+    }
+
+    // 2) forget the live session
+    await setLastPayload('', '');
+    await setLastReplacements([]);
+    await setLastXpathReplacements([]);
+    await setLastReferenceEdits([]);
+    await setLastReferenceClones([]);
+
+    // 3) delete this page's rule, so nothing returns after a refresh
+    let rulesDeleted = 0;
+    if (url) {
+        const rules = await getRules();
+        const kept = rules.filter((r) => !urlMatchesPattern(url, r.pattern));
+        rulesDeleted = rules.length - kept.length;
+        if (rulesDeleted > 0) await setRules(kept);
+    }
+
+    // 4) drop the code and the target tab, then close the socket
+    await setStoredCodeAndTab('', null);
+    forceReconnect();
+
+    console.log('Live Editor — disconnected: page reverted,', rulesDeleted, 'rule(s) deleted');
+    return { ok: true, rulesDeleted };
 }
 
 /* ---------- 2. WebSocket with the relay server ---------- */
@@ -444,6 +568,8 @@ async function connectWebSocket() {
     const code = await getStoredCode();
     if (!code) return;
 
+    await loadRelayPreference();
+
     // already connected — nothing to do
     if (socket && socket.readyState === WebSocket.OPEN) return;
 
@@ -462,16 +588,21 @@ async function connectWebSocket() {
 
     clearConnectWatchdog();
 
-    const thisSocket = new WebSocket(RELAY_URL);
+    const url = currentRelayUrl();
+    const thisSocket = new WebSocket(url);
     socket = thisSocket;
+
+    // a socket that never opened means this address is the wrong one
+    let everOpened = false;
 
     // if it has not opened in time, abandon it and try again
     connectWatchdog = setTimeout(() => {
         connectWatchdog = null;
         if (thisSocket.readyState !== WebSocket.OPEN) {
-            console.warn('Infuse \u2014 connection timed out, retrying');
+            console.warn('Infuse — ' + url + ' timed out, trying the other address');
             try { thisSocket.close(); } catch {}
             if (socket === thisSocket) socket = null;
+            nextRelayUrl();
             setConnectionStatus(false);
             scheduleReconnect();
         }
@@ -479,7 +610,10 @@ async function connectWebSocket() {
 
     thisSocket.addEventListener('open', () => {
         clearConnectWatchdog();
+        everOpened = true;
         reconnectDelay = 1000;
+        console.log('Infuse — relay connected:', url);
+        chrome.storage.local.set({ lastRelayUrl: url });
         thisSocket.send(JSON.stringify({ type: 'register', role: 'extension', code }));
         pendingOutbound.forEach((payload) => thisSocket.send(JSON.stringify(payload)));
         pendingOutbound = [];
@@ -492,6 +626,12 @@ async function connectWebSocket() {
     thisSocket.addEventListener('close', () => {
         clearConnectWatchdog();
         if (socket === thisSocket) socket = null;   // let the next attempt build a new one
+
+        /* Never opened -> this address does not answer (nothing listening
+           locally, or a 404 from the deployed one). Move to the other one.
+           A socket that DID open and then dropped keeps the same address. */
+        if (!everOpened) nextRelayUrl();
+
         setConnectionStatus(false);
         scheduleReconnect();
     });
@@ -752,7 +892,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
             chrome.storage.local.get('connectionStatus'),
         ]).then(([code, statusData]) => {
             /* Report what is actually true right now.
-               The stored flag can go stale \u2014 for instance the socket dies
+               The stored flag can go stale — for instance the socket dies
                while the machine is asleep and nothing gets a chance to write
                false, or it reconnects and nothing writes true. If the socket
                is not live, we are not connected, whatever the flag says. */
@@ -766,6 +906,16 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
             sendResponse({ pairingCode: code, isConnected });
         });
+        return true;
+    }
+
+    if (message.type === 'disconnectAndWipe') {
+        disconnectAndWipe()
+            .then(sendResponse)
+            .catch((err) => {
+                console.error('Live Editor — disconnect failed:', err?.message || err);
+                sendResponse({ ok: false });
+            });
         return true;
     }
 

@@ -23,6 +23,11 @@
 
 const STYLE_TAG_ID = '__live_editor_style__';
 
+/* Every text node the local Replacement overwrote, and what it said before.
+   Without this, Disconnect could stop new replacements but never take back
+   the ones already written. */
+const replacementOriginals = new Map();
+
 function applyCSS(cssText) {
     let styleTag = document.getElementById(STYLE_TAG_ID);
     if (!styleTag) {
@@ -345,6 +350,18 @@ function applyXPathRule(rule, index) {
 
     rule.xpath = getElementXPath(el);
     chrome.runtime.sendMessage({ type: 'xpathRuleResolved', index, xpath: rule.xpath }).catch(() => {});
+
+    /* Remember the original text BEFORE the first write, under the same key the
+       fast route above uses. Without this, the very first write went unrecorded:
+       the next interval tick would then record the ALREADY CHANGED text as the
+       original, and Disconnect would "restore" the page to the wrong value. */
+    refRememberOriginal('xpath|' + rule.xpath, (() => {
+        const node = el;
+        const was  = el.textContent;
+        return function restore() {
+            if (node.isConnected) node.textContent = was;
+        };
+    })());
 
     // CRITICAL: write ONLY if it really changed.
     // Without this check, the text was rewritten every 1.35s even when identical,
@@ -1138,10 +1155,63 @@ function startSharedInterval() {
    MESSAGES FROM background.js
    ============================================================ */
 
+/* ============================================================
+   REVERT — put the page back exactly as it was
+   ------------------------------------------------------------
+   Sent by background.js when you press Disconnect. Undoes, in one
+   pass, every kind of change this script can make:
+
+     - Replacement text        -> replacementOriginals
+     - XPath + Reference edits -> refOriginals (refRestoreRemoved)
+     - the copies              -> [data-le-clone]
+     - the injected CSS        -> the <style> tag
+
+   Emptying the three lists also stops the shared interval on its own,
+   so nothing re-applies a moment later.
+
+   The injected JS is the one thing that cannot be taken back: code
+   that has already run stays run. It is simply never injected again.
+   ============================================================ */
+function revertEverything() {
+    // 1) the text Replacement overwrote
+    replacementOriginals.forEach((was, node) => {
+        try {
+            if (node.isConnected) node.textContent = was;
+        } catch {}
+    });
+    replacementOriginals.clear();
+
+    if (window.__liveEditorReplaceObserver) {
+        try {
+            window.__liveEditorReplaceObserver.disconnect();
+        } catch {}
+        window.__liveEditorReplaceObserver = null;
+    }
+
+    // 2) XPath rules and Reference edits both keep their originals in refOriginals
+    refRestoreRemoved([]);
+    currentReferenceEdits = [];
+    currentXpathRules = [];
+
+    // 3) the copies made with "Create new"
+    document.querySelectorAll('[data-le-clone]').forEach((el) => el.remove());
+    currentReferenceClones = [];
+
+    // 4) the injected CSS
+    const styleTag = document.getElementById(STYLE_TAG_ID);
+    if (styleTag) styleTag.remove();
+
+    refLog('everything reverted — the page is back to its original state');
+}
+
 chrome.runtime.onMessage.addListener((message) => {
     if (!message || typeof message.type !== 'string') return;
 
     try {
+        if (message.type === 'revertAll') {
+            revertEverything();
+        }
+
         if (message.type === 'reference' && message.ref) {
             referenceFindPath(message.ref);
         }
@@ -1151,9 +1221,16 @@ chrome.runtime.onMessage.addListener((message) => {
         }
 
         if (message.type === 'referenceEdits' && Array.isArray(message.edits)) {
-            // put back anything that dropped out of the list before applying
-            // the new set — otherwise old edits linger on the page forever
-            refRestoreRemoved(message.edits);
+            /* Put back anything that dropped out of the list before applying the
+               new set — otherwise old edits linger on the page forever.
+
+               The XPath rules keep their originals in the SAME map, so their keys
+               have to be listed here as well. Without them, every 'referenceEdits'
+               message silently reverted the XPath rules too. */
+            refRestoreRemoved([
+                ...message.edits,
+                ...currentXpathRules.filter((r) => r.xpath).map((r) => ({ key: 'xpath|' + r.xpath })),
+            ]);
 
             currentReferenceEdits = message.edits;
             reapplyAllReferenceEdits();
@@ -1263,7 +1340,12 @@ chrome.runtime.sendMessage({ type: 'referenceRequestPersisted' }).catch(() => {}
                     }
                 }
 
-                if (text !== original) node.textContent = text;
+                if (text !== original) {
+                    if (!replacementOriginals.has(node)) {
+                        replacementOriginals.set(node, original);
+                    }
+                    node.textContent = text;
+                }
             }
         }
 

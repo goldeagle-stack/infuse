@@ -219,5 +219,5 @@ wss.on('connection', (ws) => {
 
 server.listen(PORT, '0.0.0.0', () => {
     console.log(`Infuse — page + WebSocket on port ${PORT}`);
-    console.log(`   lokalisht: http://127.0.0.1:${PORT}`);
+    console.log(`   locally:   http://127.0.0.1:${PORT}`);
 });

@@ -37,6 +37,6 @@
     }
   ],
   "content_security_policy": {
-    "extension_pages": "script-src 'self'; object-src 'self'; connect-src wss://infuse-production-d6d4.up.railway.app"
+    "extension_pages": "script-src 'self'; object-src 'self'; connect-src wss://infuse-production-d6d4.up.railway.app ws://127.0.0.1:8080 ws://localhost:8080"
   }
 }

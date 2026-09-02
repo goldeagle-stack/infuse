@@ -43,14 +43,14 @@
   ],
   "browser_specific_settings": {
     "gecko": {
-      "id": "6dfbfc53-b822-4c90-a0ae-48fd2642d41a",
-      "strict_min_version": "109.0",
+      "id": "infuse@daniel.dev",
+      "strict_min_version": "140.0",
       "data_collection_permissions": {
         "required": ["none"]
       }
     }
   },
   "content_security_policy": {
-    "extension_pages": "script-src 'self'; object-src 'self'; connect-src wss://infuse-production-d6d4.up.railway.app"
+    "extension_pages": "script-src 'self'; object-src 'self'; connect-src wss://infuse-production-d6d4.up.railway.app ws://127.0.0.1:8080 ws://localhost:8080"
   }
 }
