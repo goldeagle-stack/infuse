@@ -1,0 +1,204 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Infuse</title>
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<div class="app">
+
+    <!-- ===== RAIL — expands / collapses ===== -->
+    <aside class="rail" id="rail">
+        <button class="rail__toggle" id="rail-toggle" title="Expand / Collapse">☰</button>
+
+        <button class="rail__icon active" data-role="editor" title="Editor">
+            <span class="rail__icon-glyph">✎</span>
+            <span class="rail__icon-label">Editor</span>
+        </button>
+        <button class="rail__icon" data-role="replacement" title="Replacement">
+            <span class="rail__icon-glyph">⇄</span>
+            <span class="rail__icon-label">Replacement</span>
+        </button>
+        <button class="rail__icon" data-role="xpath" title="XPath">
+            <span class="rail__icon-glyph">⌗</span>
+            <span class="rail__icon-label">XPath</span>
+        </button>
+    </aside>
+
+    <!-- ===== RULES COLUMN — stored permanently, per domain ===== -->
+    <aside class="rules" id="rules-panel">
+        <div class="rules__head">
+            <span class="rules__title">RULES (<span id="rules-count">0</span>)</span>
+        </div>
+
+        <input type="text" class="rules__find" id="rules-find" placeholder="Search…">
+
+        <div class="rules__list" id="rules-list">
+            <!-- rules are added dynamically by app.js -->
+        </div>
+    </aside>
+
+    <!-- ===== CONTENT ===== -->
+    <div class="content">
+
+        <header class="topbar">
+            <div class="topbar__field">
+                <span class="topbar__label">Pairing code</span>
+                <span class="topbar__value topbar__code" id="pairing-code">------</span>
+            </div>
+
+            <div class="topbar__field topbar__field--status">
+                <span class="topbar__status" id="status-dot"></span>
+                <span class="topbar__value" id="status-text">Not connected</span>
+            </div>
+
+            <div class="topbar__field topbar__field--rule">
+                <span class="topbar__label">Active rule</span>
+                <span class="topbar__value topbar__rule" id="active-rule-name">— none —</span>
+            </div>
+
+            <button class="btn-ghost" id="regen-btn" title="Generate a new code">↻ New code</button>
+            <button class="btn-save" id="save-btn">Save</button>
+        </header>
+
+        <!-- ===== VIEW 1: EDITOR (JS + CSS) ===== -->
+        <main class="panes" id="view-editor">
+            <section class="pane">
+                <div class="pane__label">JS</div>
+                <div class="pane__body">
+                    <div class="pane__lines" id="lines-js">1</div>
+                    <div class="pane__code">
+                        <pre class="pane__highlight" id="hl-js" aria-hidden="true"></pre>
+                        <textarea class="pane__input" id="editor-js" spellcheck="false" placeholder="Start typing JavaScript here"></textarea>
+                    </div>
+                </div>
+            </section>
+
+            <section class="pane">
+                <div class="pane__label">CSS</div>
+                <div class="pane__body">
+                    <div class="pane__lines" id="lines-css">1</div>
+                    <div class="pane__code">
+                        <pre class="pane__highlight" id="hl-css" aria-hidden="true"></pre>
+                        <textarea class="pane__input" id="editor-css" spellcheck="false" placeholder="Start typing CSS here"></textarea>
+                    </div>
+                </div>
+            </section>
+        </main>
+
+        <!-- ===== VIEW 2: REPLACEMENT ===== -->
+        <main class="replacement" id="view-replacement" hidden>
+            <div class="replacement__title">Replacement</div>
+            <p class="replacement__hint">Type what should be found (element/text) and what it should be replaced with.</p>
+
+            <div class="replacement__rows" id="replacement-rows">
+                <!-- rows are added dynamically by app.js -->
+            </div>
+
+            <div class="replacement__actions">
+                <button class="btn-ghost" id="add-replacement-btn">+ Add another</button>
+                <button class="btn-save" id="apply-replacement-btn">Apply</button>
+            </div>
+        </main>
+
+        <!-- ===== VIEW 3: XPATH ===== -->
+        <main class="replacement" id="view-xpath" hidden>
+            <div class="replacement__title">XPath</div>
+            <p class="replacement__hint">Find a value and pin it with an xpath — it stays fixed, and will not drift if the page changes it later on its own.</p>
+
+            <div class="replacement__rows" id="xpath-rows">
+                <!-- rows are added dynamically by app.js -->
+            </div>
+
+            <div class="replacement__actions">
+                <button class="btn-ghost" id="add-xpath-btn">+ Add another</button>
+                <button class="btn-save" id="apply-xpath-btn">Apply</button>
+            </div>
+
+            <!-- ===== REFERENCE — real snapshot / live DOM + editable elements ===== -->
+            <hr class="xr-divider">
+
+            <!-- ===== PANEL TEMPLATE — cloned each time a reference is added ===== -->
+            <template id="ref-panel-template">
+                <div class="ref-panel">
+                    <div class="ref-panel__title">Reference <span data-el="ref-num"></span></div>
+
+                    <div class="ref-search">
+                        <input type="text" data-el="ref-find" placeholder="Text to find">
+                        <input type="number" data-el="ref-occurrence" min="0" placeholder="Match # (first)" class="ref-occurrence-input">
+                        <button class="btn-ghost" data-el="ref-find-btn">Search</button>
+                    </div>
+
+                    <div class="ref-path-row">
+                        <input type="text" data-el="ref-xpath-input" placeholder="/html/body/…" class="ref-path-input">
+                        <button class="ref-arrow" data-el="ref-up-btn" title="Parent">▲</button>
+                        <button class="ref-arrow" data-el="ref-down-btn" title="First child">▼</button>
+                        <button class="ref-arrow" data-el="ref-prev-btn" title="Previous sibling">◀</button>
+                        <button class="ref-arrow" data-el="ref-next-btn" title="Next sibling">▶</button>
+                        <button class="ref-arrow" data-el="ref-refresh-btn" title="Re-read this path">⟳</button>
+                    </div>
+
+                    <div class="refstatus" data-el="ref-status"></div>
+
+                    <div class="ref-meta">
+                        <div class="ref-meta__item"><span>Tag</span><b data-el="ref-meta-tag">—</b></div>
+                        <div class="ref-meta__item"><span>ID</span><b data-el="ref-meta-id">—</b></div>
+                        <div class="ref-meta__item"><span>Class</span><b data-el="ref-meta-class">—</b></div>
+                        <div class="ref-meta__item"><span>Size</span><b data-el="ref-meta-size">—</b></div>
+                        <div class="ref-meta__item ref-meta__item--wide"><span>XPath</span><b data-el="ref-meta-xpath">—</b></div>
+                    </div>
+
+                    <div class="ref-body">
+                        <div class="ref-preview">
+                            <div class="ref-preview__box">
+                                <div class="ref-preview-empty" data-el="ref-preview-empty">Nothing found yet — type something above and click "Search"</div>
+                                <iframe data-el="ref-live" title="Live DOM" hidden></iframe>
+                            </div>
+                        </div>
+
+                        <div class="ref-items-panel">
+                            <div class="ref-items__head">
+                                <input type="text" data-el="ref-filter" placeholder="Filter elements…">
+                                <span data-el="ref-items-count">0 / 0</span>
+                            </div>
+                            <div class="ref-items" data-el="ref-items">
+                                <div class="refitem__empty">No reference yet. Type a value above and click "Search".</div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <div class="ref-actions">
+                        <button class="btn-ghost" data-el="ref-clear-btn">Clear</button>
+
+                        <div class="ref-create">
+                            <select data-el="ref-position" class="ref-position" title="Where to place the new copy"></select>
+                            <button class="btn-ghost" data-el="ref-create-btn">Create new</button>
+                        </div>
+                        <button class="btn-remove-ref" data-el="ref-remove-btn" title="Remove this reference">Remove reference</button>
+                        <button class="btn-save" data-el="ref-apply-btn">Apply</button>
+                    </div>
+                </div>
+            </template>
+
+            <!-- ===== REFERENCE PANELS — as many as you like ===== -->
+            <div id="ref-panels"></div>
+
+            <div class="refadd">
+                <button class="btn-ghost btn-addref" id="ref-add-btn">+ Add reference</button>
+            </div>
+
+            <!-- ===== APPLY ALL — XPath + every reference at once ===== -->
+            <div class="applyall">
+                <button class="btn-applyall" id="apply-all-btn">APPLY ALL</button>
+                <span class="applyall__hint">Sends every XPath rule and every reference in one go</span>
+            </div>
+        </main>
+
+    </div>
+</div>
+
+<script src="app.js"></script>
+</body>
+</html>

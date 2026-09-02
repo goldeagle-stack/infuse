@@ -1,0 +1,27 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Extension</title>
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div class="main">
+    <h1>Infuse</h1>
+
+    <div id="code-wrap">
+        <label for="code-input">Code (from editor-app)</label>
+        <input id="code-input" type="text" placeholder="e.g. X7K2M9" maxlength="8" autocomplete="off" spellcheck="false">
+    </div>
+
+    <button id="connect-btn" class="copy-btn">Connect</button>
+
+    <div class="status-row">
+        <span id="status-dot" class="status-dot"></span>
+        <span id="status-text">Not connected</span>
+    </div>
+</div>
+
+<script src="popup.js"></script>
+</body>
+</html>

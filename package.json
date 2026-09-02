@@ -1,0 +1,15 @@
+{
+  "name": "infuse",
+  "version": "1.0.0",
+  "description": "Infuse — live CSS/JS editor (editor-app + relay server)",
+  "main": "relay-server/server.js",
+  "scripts": {
+    "start": "node relay-server/server.js"
+  },
+  "dependencies": {
+    "ws": "^8.17.0"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
