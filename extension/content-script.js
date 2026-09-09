@@ -321,7 +321,20 @@ function applyXPathRule(rule, index) {
 
     // the fast route: the path is known
     if (rule.xpath) {
-        const target = getElementByXPath(rule.xpath);
+        /* The path is evaluated ONCE and the element itself is kept. Every
+           pass after that is a pointer check and a string compare — no
+           document.evaluate at all. That matters now that a pass runs on
+           every batch of mutations instead of once every 1.35s: measured on
+           a page being built, keeping the element costs ~1ms where looking
+           it up again cost ~70ms.
+
+           When the page throws that element away (a re-render), isConnected
+           turns false by itself and the path is looked up again. */
+        let target = (rule.__el && rule.__el.isConnected) ? rule.__el : null;
+        if (!target) {
+            target = getElementByXPath(rule.xpath);
+            rule.__el = (target && target.nodeType === 1) ? target : null;
+        }
         if (!target) return;
 
         // remember the original text once, so this can be undone later
@@ -339,12 +352,35 @@ function applyXPathRule(rule, index) {
         return;
     }
 
-    // no path yet: try ONCE to find it by text
-    if (rule.__resolveFailed) return; // it failed once — do not try again
+    /* ---------- no path yet: find it by text ----------
+
+       Two things have to be right here, and they are the reason a rule that
+       came from STORAGE (refresh mode, or simply opening the page again)
+       used to end up with no path at all while the very same rule found it
+       instantly when it was pushed to a page that had already loaded:
+
+       1. DO NOT SEARCH A PAGE THAT IS NOT THERE YET.
+          This engine starts at 'document_start'. <body> exists, but it is
+          empty — the page has not been parsed. Searching it finds nothing,
+          of course.
+
+       2. ONE MISS IS NOT A FAILURE.
+          A single miss used to mark the rule dead for good, so the 1.35s
+          pass below never looked again — not even once the page was fully
+          there. Now a miss only counts once the document has been parsed,
+          and the rule is given a few passes before it is given up on: long
+          enough for text the page renders with its own JavaScript, short
+          enough that a value which really is not there stops costing a
+          full-page search every 1.35 seconds. */
+    if (rule.__resolveFailed) return;      // given up on — do not search again
+    if (document.readyState === 'loading') return;   // the page is still arriving
 
     const el = resolveElementByReferenceOccurrence(rule.find, rule.occurrence);
     if (!el) {
-        rule.__resolveFailed = true;
+        rule.__resolveTries = (rule.__resolveTries || 0) + 1;
+        if (rule.__resolveTries >= XPATH_MAX_RESOLVE_TRIES) {
+            rule.__resolveFailed = true;
+        }
         return;
     }
 
@@ -382,8 +418,19 @@ function applyXPathRule(rule, index) {
 let currentXpathRules = [];
 let xpathIntervalStarted = false;
 
-function reapplyAllXpathRules() {
-    currentXpathRules.forEach((rule, i) => applyXPathRule(rule, rule.index ?? i));
+/* How many passes a rule gets to find its value before it is given up on.
+   The pass runs every 1.35s, so this is roughly 11 seconds after the page has
+   been parsed — enough for content the page renders itself. */
+const XPATH_MAX_RESOLVE_TRIES = 8;
+
+function reapplyAllXpathRules(pinnedOnly) {
+    currentXpathRules.forEach((rule, i) => {
+        /* Finding a path by TEXT walks the whole document. That is fine once,
+           on a schedule — never on every mutation while the page is being
+           parsed. A path already pinned costs one document.evaluate. */
+        if (pinnedOnly && !rule.xpath) return;
+        applyXPathRule(rule, rule.index ?? i);
+    });
 }
 
 function startXpathInterval() {
@@ -399,7 +446,7 @@ chrome.runtime.onMessage.addListener((message) => {
         ]);
 
         // new rules -> clear the failure flag, so they get tried again
-        currentXpathRules = message.rules.map((r) => ({ ...r, __resolveFailed: false }));
+        currentXpathRules = message.rules.map((r) => ({ ...r, __resolveFailed: false, __resolveTries: 0 }));
         reapplyAllXpathRules();
         startXpathInterval();
     }
@@ -789,16 +836,274 @@ function refBuildAncestorChain(el) {
     return chain;
 }
 
+/* ============================================================
+   THE WHOLE PAGE — the snapshot the preview really shows
+   ------------------------------------------------------------
+   Until now only the chosen element travelled back, and the preview
+   rebuilt a tiny fake page around it. You saw the element, but never
+   WHERE it sits.
+
+   Now the entire page goes with it, exactly as it stands, with the chosen
+   element carrying a mark (REF_TARGET_MARK) so the editor can find it
+   again and draw the lilac outline around it — and around nothing else.
+
+   What is stripped out: everything that would run, load or navigate on
+   its own inside the preview (scripts, frames, plugins, meta-refresh).
+   The look stays; the behaviour does not.
+   ============================================================ */
+const REF_TARGET_MARK = 'data-le-ref-target';
+const REF_MAX_PAGE_CHARS = 2500000;
+const REF_MAX_PAGE_CSS_CHARS = 800000;
+
+function refAbsoluteUrl(url, base) {
+    try {
+        return new URL(url, base).href;
+    } catch {
+        return url;
+    }
+}
+
+/* A rule taken out of its stylesheet loses the address it was written
+   against: "url(../img/x.png)" inside /assets/app.css points somewhere else
+   entirely once it sits inside the page itself. So every url() is pinned to
+   the sheet it came from before it is inlined. */
+function refRewriteCssUrls(cssText, base) {
+    if (!base) return String(cssText);
+    return String(cssText).replace(
+        /url\(\s*(['"]?)([^'")]+)\1\s*\)/gi,
+        (whole, quote, raw) => {
+            const url = raw.trim();
+            if (!url || /^(data:|blob:|about:|https?:|\/\/|#)/i.test(url)) return whole;
+            return 'url("' + refAbsoluteUrl(url, base) + '")';
+        }
+    );
+}
+
+function refSerializeSheet(sheet, budget) {
+    let rules;
+    try {
+        rules = sheet.cssRules;      // throws on a genuinely cross-origin sheet
+    } catch {
+        return null;
+    }
+    if (!rules) return null;
+
+    const base = sheet.href || document.baseURI;
+    let out = '';
+
+    for (const rule of Array.from(rules)) {
+        out += refRewriteCssUrls(rule.cssText, base) + '\n';
+        if (out.length > budget) break;
+    }
+
+    // a </style> inside a CSS string would end the tag early and take the rest
+    // of the page with it; "\/" means the same thing to a CSS parser
+    return out.replace(/<\/(style)/gi, '<\\/$1');
+}
+
+/* these two turn a plain stylesheet fetch into a CORS one — and a CORS fetch
+   the other site never agreed to means no stylesheet at all */
+function refStripLinkGuards(node) {
+    if (!node || node.tagName !== 'LINK') return;
+    try {
+        node.removeAttribute('crossorigin');
+        node.removeAttribute('integrity');
+    } catch {}
+}
+
+/* ============================================================
+   THE CSS — why some pages used to come back as bare HTML
+   ------------------------------------------------------------
+   The clone carries <link> tags, and inside the preview each one has to be
+   fetched all over again. Three things routinely stop that:
+
+     - the link carries crossorigin/integrity, so the fetch becomes a CORS
+       request the other site never agreed to, and the sheet is dropped
+     - the editor runs on https while the page's CSS sits on http
+       (mixed content — blocked outright, no way around it)
+     - the styles were never in the HTML to begin with: styled-components
+       and friends push their rules straight into an EMPTY <style> tag, and
+       adoptedStyleSheets live in no markup at all
+
+   So rather than hoping the links load, every stylesheet the browser has
+   ALREADY parsed is read out and written into the clone IN PLACE, exactly
+   where its own <link>/<style> stood — the cascade order is untouched.
+   Whatever cannot be read (a real cross-origin sheet) keeps its link,
+   stripped of the attributes that would have made the fetch fail.
+   ============================================================ */
+function refInlineStylesheets(clone) {
+    const SEL = 'link[rel~="stylesheet" i], style';
+
+    let liveNodes, cloneNodes;
+    try {
+        liveNodes  = Array.from(document.querySelectorAll(SEL));
+        cloneNodes = Array.from(clone.querySelectorAll(SEL));
+    } catch {
+        return;
+    }
+
+    let budget = REF_MAX_PAGE_CSS_CHARS;
+
+    /* The clone was taken a moment ago and nothing has touched the page
+       since, so node N here is node N there. If that ever stops holding,
+       leave every link alone rather than put the wrong CSS in the wrong
+       place. */
+    if (liveNodes.length !== cloneNodes.length) {
+        cloneNodes.forEach(refStripLinkGuards);
+    } else {
+        liveNodes.forEach((liveNode, i) => {
+            const cloneNode = cloneNodes[i];
+            if (!cloneNode) return;
+
+            // a <style> that still holds its own text is already in the clone
+            if (liveNode.tagName === 'STYLE' && liveNode.textContent.trim()) return;
+
+            const sheet = liveNode.sheet;
+            if (!sheet || sheet.disabled || budget <= 0) {
+                refStripLinkGuards(cloneNode);
+                return;
+            }
+
+            const css = refSerializeSheet(sheet, budget);
+            if (!css) {
+                refStripLinkGuards(cloneNode);
+                return;
+            }
+
+            budget -= css.length;
+
+            const styleTag = document.createElement('style');
+            const media = liveNode.getAttribute('media')
+                || (sheet.media && sheet.media.mediaText)
+                || '';
+            if (media) styleTag.setAttribute('media', media);
+            styleTag.textContent = css;
+
+            try {
+                cloneNode.replaceWith(styleTag);
+            } catch {
+                refStripLinkGuards(cloneNode);
+            }
+        });
+    }
+
+    // ADOPTED sheets — attached from JavaScript, present in no markup at all
+    try {
+        let extra = '';
+        for (const sheet of Array.from(document.adoptedStyleSheets || [])) {
+            if (budget <= 0) break;
+            const css = refSerializeSheet(sheet, budget);
+            if (!css) continue;
+            budget -= css.length;
+            extra += css + '\n';
+        }
+
+        if (extra) {
+            const head = clone.querySelector('head') || clone;
+            const styleTag = document.createElement('style');
+            styleTag.setAttribute('data-le-adopted', '1');
+            styleTag.textContent = extra;
+            head.appendChild(styleTag);
+        }
+    } catch {}
+}
+
+/* The clone copies the ATTRIBUTES, and a field's attribute still holds
+   whatever it started with — not what is in it now. Anything typed (or
+   filled in by the site) would be missing from the picture, so it is
+   carried over by hand. */
+function refSyncFieldValues(clone) {
+    let live, copy;
+    try {
+        live = document.querySelectorAll('input,textarea,select');
+        copy = clone.querySelectorAll('input,textarea,select');
+    } catch {
+        return;
+    }
+    if (live.length !== copy.length) return; // shapes drifted apart — leave it alone
+
+    live.forEach((el, i) => {
+        const c = copy[i];
+        if (!c) return;
+        try {
+            if (el.tagName === 'TEXTAREA') {
+                c.textContent = el.value;
+            } else if (el.tagName === 'SELECT') {
+                Array.from(c.options).forEach((opt, j) => {
+                    if (el.options[j] && el.options[j].selected) opt.setAttribute('selected', '');
+                    else opt.removeAttribute('selected');
+                });
+            } else if (el.type === 'checkbox' || el.type === 'radio') {
+                if (el.checked) c.setAttribute('checked', '');
+                else c.removeAttribute('checked');
+            } else {
+                c.setAttribute('value', el.value ?? '');
+            }
+        } catch {}
+    });
+}
+
+function refBuildPageSnapshot(el) {
+    let clone = null;
+
+    // the mark goes on the real element for the length of one clone, no longer
+    try {
+        el.setAttribute(REF_TARGET_MARK, '1');
+        clone = document.documentElement.cloneNode(true);
+    } catch {
+        return null;
+    } finally {
+        try { el.removeAttribute(REF_TARGET_MARK); } catch {}
+    }
+
+    if (!clone) return null;
+
+    try {
+        refSyncFieldValues(clone);
+        refInlineStylesheets(clone);
+
+        clone.querySelectorAll(
+            'script,noscript,template,iframe,frame,object,embed,meta[http-equiv],base,#' + PANEL_HOST_ID
+        ).forEach((n) => n.remove());
+
+        // nothing in the preview may be marked except the one element
+        clone.querySelectorAll('[' + REF_TARGET_MARK + ']').forEach((n, i) => {
+            if (i > 0) n.removeAttribute(REF_TARGET_MARK);
+        });
+
+        const html = '<!DOCTYPE html>' + clone.outerHTML;
+
+        // a page too big to send is no page at all — the editor then falls
+        // back to the old element-only preview by itself
+        if (html.length > REF_MAX_PAGE_CHARS) {
+            refLog('page snapshot skipped — too big:', html.length, 'chars');
+            return null;
+        }
+
+        return html;
+    } catch (err) {
+        refLog('page snapshot failed:', err);
+        return null;
+    }
+}
+
 function refBuildSnapshot(el) {
     try {
         const clone = el.cloneNode(true);
         clone.querySelectorAll('script,noscript').forEach((n) => n.remove());
+
+        const page = refBuildPageSnapshot(el);   // ADDED — the whole page around it
+
         return {
             html: clone.outerHTML,
-            css: refCollectCss(),
+            /* The page brings its own <style> and <link> tags with it, so the
+               gathered CSS is dead weight there — it is only worth collecting
+               (and sending) for the element-only fallback. */
+            css: page ? '' : refCollectCss(),
             baseHref: document.baseURI,
             tag: el.tagName.toLowerCase(),
             ancestors: refBuildAncestorChain(el), // ADDED — the real parent chain
+            page,
         };
     } catch {
         return null;
@@ -871,7 +1176,12 @@ function refRestoreRemoved(nextEdits) {
 let referenceIntervalStarted = false;
 
 function applyReferenceEdit(e) {
-    const el = refResolveTarget(e);   // by its own id, not by position
+    // the element is kept once found — see the note in applyXPathRule
+    let el = (e.__el && e.__el.isConnected) ? e.__el : null;
+    if (!el) {
+        el = refResolveTarget(e);   // by its own id, not by position
+        e.__el = (el && el.nodeType === 1) ? el : null;
+    }
     if (!el || el.nodeType !== 1) return;
 
     // Record what this element looked like before we touch it, once.
@@ -1060,7 +1370,13 @@ function refApplyEditsToElement(rootEl, edits) {
 
 function applyReferenceClone(clone) {
     // if this clone already exists on the page, do not create it again
-    if (document.querySelector(`[data-le-clone="${clone.id}"]`)) return;
+    if (clone.__el && clone.__el.isConnected) return;   // kept, as above
+
+    const existing = document.querySelector(`[data-le-clone="${clone.id}"]`);
+    if (existing) {
+        clone.__el = existing;
+        return;
+    }
 
     const source = getElementByXPath(clone.xpath);
     if (!source || source.nodeType !== 1) return;
@@ -1090,6 +1406,8 @@ function applyReferenceClone(clone) {
     const anchor = siblings[pos] || null;
     if (anchor) parent.insertBefore(copy, anchor);
     else parent.appendChild(copy);
+
+    clone.__el = copy;
 
     refLog('clone created at position', pos, '—', clone.id);
 }
@@ -1135,9 +1453,82 @@ function hasWorkToDo() {
         || (currentReferenceClones && currentReferenceClones.length > 0);
 }
 
-function startSharedInterval() {
-    if (sharedIntervalId !== null) return;
+/* ============================================================
+   INSTANT — what makes Replacement feel immediate, given to the rest
+   ------------------------------------------------------------
+   Everything here used to be driven by ONE pass every 1.35 seconds. On a
+   page that is still loading that is an age: the page draws the old value,
+   you see it sitting there, and only then does it flip. That was the
+   slowness — not the work itself, which takes microseconds.
+
+   A MutationObserver changes WHEN the work happens: the page reports a new
+   node the instant it is parsed, and the rules land with it. A pinned path
+   is therefore written as early as the parser reaches the element — exactly
+   as early as Replacement, which has always been driven this way.
+
+   The 1.35s pass stays behind it as a safety net, for values a page changes
+   in ways no observer reports.
+
+   Only CHEAP work runs on a mutation: pinned paths, the reference edits,
+   the clones. Searching by text keeps to the slow lane (and to
+   DOMContentLoaded, where the document is whole for the first time).
+   ============================================================ */
+let sharedObserver = null;
+let sharedPassQueued = false;
+
+function runFastPass() {
     if (!hasWorkToDo()) return;
+    reapplyAllXpathRules(true);                 // pinned paths only
+    reapplyAllReferenceEdits();
+    currentReferenceClones.forEach((c) => applyReferenceClone(c));
+}
+
+function queueSharedPass() {
+    if (sharedPassQueued) return;   // one pass per batch of mutations, not per node
+    sharedPassQueued = true;
+    Promise.resolve().then(() => {
+        sharedPassQueued = false;
+        runFastPass();
+    });
+}
+
+function startSharedObserver() {
+    if (sharedObserver) return;
+
+    const root = document.documentElement;
+    if (!root) return;
+
+    sharedObserver = new MutationObserver(queueSharedPass);
+    sharedObserver.observe(root, { childList: true, subtree: true, characterData: true });
+
+    /* Every write below is guarded by "only if it differs", so our own writes
+       settle on the next pass instead of setting off a loop. */
+
+    /* The first search by text needs the WHOLE document (Match # counts from
+       the top of it), so it runs the moment the document is parsed — not on
+       the next 1.35s tick, which is where the rest of the wait came from. */
+    if (document.readyState === 'loading') {
+        document.addEventListener('DOMContentLoaded', () => {
+            if (!hasWorkToDo()) return;
+            reapplyAllXpathRules();
+            reapplyAllReferenceEdits();
+            reapplyAllReferenceClones();
+        }, { once: true });
+    }
+}
+
+function stopSharedObserver() {
+    if (!sharedObserver) return;
+    try { sharedObserver.disconnect(); } catch {}
+    sharedObserver = null;
+}
+
+function startSharedInterval() {
+    if (!hasWorkToDo()) return;
+
+    startSharedObserver();   // the fast lane; the interval below is the safety net
+
+    if (sharedIntervalId !== null) return;
 
     sharedIntervalId = setInterval(() => {
         if (!hasWorkToDo()) {
@@ -1197,7 +1588,10 @@ function revertEverything() {
     document.querySelectorAll('[data-le-clone]').forEach((el) => el.remove());
     currentReferenceClones = [];
 
-    // 4) the injected CSS
+    // 4) the fast lane stops with the rules it was serving
+    stopSharedObserver();
+
+    // 5) the injected CSS
     const styleTag = document.getElementById(STYLE_TAG_ID);
     if (styleTag) styleTag.remove();
 
@@ -1254,6 +1648,333 @@ refLog('new content-script loaded ✓');
 
 /* ---------- after a refresh: the background re-sends the edits to us ---------- */
 chrome.runtime.sendMessage({ type: 'referenceRequestPersisted' }).catch(() => {});
+
+/* ============================================================
+   THE IN-PAGE PANEL — for Android, where there is no popup
+   ------------------------------------------------------------
+   Firefox for Android does not have an anchored popup: tapping the
+   toolbar icon opens the extension's popup as a WHOLE SEPARATE SCREEN.
+   It can be made to look right (it is), but it is still the wrong shape
+   for this tool — you leave the page you are working on, type a code,
+   and come back.
+
+   So on Android background.js switches that popup off, and the tap
+   arrives here instead: the same panel is built INSIDE the page and
+   slides down from the top, over the page you are already on, the way a
+   message does.
+
+   It lives in a CLOSED shadow root, so the page's CSS cannot reach into
+   it and its own CSS cannot leak out onto the page. And it hangs off
+   <html>, not <body>, so none of the engines above (which all walk
+   document.body) ever see it.
+   ============================================================ */
+
+const PANEL_HOST_ID = '__infuse_panel_host__';
+
+let panelHost = null;
+let panelRoot = null;
+let panelEl = null;      // { sheet, code, connect, disconnect, dot, text }
+
+const PANEL_DOT = {
+    connected: '#a6d189',      // green
+    disconnected: '#e78284',   // red
+    pending: '#e5c890',        // yellow, while dialling
+};
+
+function panelIsOpen() {
+    return !!panelHost && panelHost.isConnected;
+}
+
+function closePanel() {
+    if (!panelHost) return;
+    try { panelHost.remove(); } catch {}
+    panelHost = null;
+    panelRoot = null;
+    panelEl = null;
+}
+
+function panelSetStatus(isConnected, customText) {
+    if (!panelEl) return;
+
+    panelEl.text.textContent = customText || (isConnected ? 'Connected' : 'Not connected');
+
+    const pending = customText === 'Connecting…';
+    const color = pending
+        ? PANEL_DOT.pending
+        : (isConnected ? PANEL_DOT.connected : PANEL_DOT.disconnected);
+
+    panelEl.dot.style.backgroundColor = color;
+    panelEl.dot.style.boxShadow = '0 0 6px ' + color;
+
+    panelEl.disconnect.hidden = !isConnected || pending;
+}
+
+function openPanel() {
+    if (panelIsOpen()) return;
+
+    panelHost = document.createElement('div');
+    panelHost.id = PANEL_HOST_ID;
+
+    /* The host itself carries no look at all — everything is inside the
+       shadow root. 'all: initial' stops the page's own rules (a global
+       "div { display: flex }" and the like) from reaching it. */
+    panelHost.style.cssText = [
+        'all: initial',
+        'position: fixed',
+        'inset: 0 0 auto 0',
+        'z-index: 2147483647',
+    ].join(';');
+
+    panelRoot = panelHost.attachShadow({ mode: 'closed' });
+
+    panelRoot.innerHTML = `
+        <style>
+            :host, * { box-sizing: border-box; }
+
+            .backdrop {
+                position: fixed;
+                inset: 0;
+                background: rgba(35, 38, 52, 0.45);
+                opacity: 0;
+                transition: opacity .18s ease;
+            }
+
+            .sheet {
+                position: relative;
+                font-family: "CaskaydiaCove Nerd Font", "Cascadia Code", "JetBrains Mono", ui-monospace, monospace;
+                background: #303446;
+                color: #c6d0f5;
+                padding: 15px 17px 18px;
+                border-radius: 0 0 14px 14px;
+                border-bottom: 1px solid #414559;
+                box-shadow: 0 12px 32px rgba(0, 0, 0, .38);
+                transform: translateY(-100%);
+                transition: transform .22s cubic-bezier(.2, .8, .3, 1);
+            }
+
+            :host(.open) .backdrop { opacity: 1; }
+            :host(.open) .sheet { transform: translateY(0); }
+
+            h1 {
+                font-size: 1.2rem;
+                font-weight: 600;
+                margin: 0 0 13px;
+                letter-spacing: .01em;
+                color: #ca9ee6;
+            }
+
+            label {
+                display: block;
+                font-size: 0.66rem;
+                letter-spacing: .06em;
+                text-transform: uppercase;
+                color: #a5adce;
+                margin-bottom: .35rem;
+            }
+
+            input {
+                width: 100%;
+                font-family: inherit;
+                font-size: 1.02rem;
+                font-weight: 600;
+                letter-spacing: .13em;
+                text-align: center;
+                text-transform: uppercase;
+                padding: 12px 14px;
+                border: 1px solid #626880;
+                border-radius: 9px;
+                background: #292c3c;
+                color: #c6d0f5;
+                outline: none;
+            }
+
+            input:focus { border-color: #babbf1; }
+
+            input::placeholder {
+                color: #737994;
+                font-weight: 400;
+                letter-spacing: normal;
+                text-transform: none;
+            }
+
+            button.act {
+                width: 100%;
+                margin-top: 9px;
+                padding: 12px 14px;
+                font-family: inherit;
+                font-size: .85rem;
+                border: 1px solid #51576d;
+                border-radius: 9px;
+                background: transparent;
+                color: #a5adce;
+                cursor: pointer;
+            }
+
+            button.act:active { background: #414559; color: #c6d0f5; }
+            button.act[hidden] { display: none; }
+
+            .status {
+                display: flex;
+                align-items: center;
+                gap: 7px;
+                margin-top: 13px;
+                font-size: .78rem;
+                color: #a5adce;
+            }
+
+            .dot {
+                width: 9px;
+                height: 9px;
+                border-radius: 50%;
+                background: #e78284;
+                flex-shrink: 0;
+            }
+
+            .x {
+                position: absolute;
+                top: 9px;
+                right: 9px;
+                width: 34px;
+                height: 34px;
+                font-family: inherit;
+                font-size: 1.15rem;
+                line-height: 1;
+                border: none;
+                border-radius: 8px;
+                background: transparent;
+                color: #737994;
+                cursor: pointer;
+            }
+
+            .x:active { background: #414559; color: #c6d0f5; }
+        </style>
+
+        <div class="backdrop"></div>
+        <div class="sheet">
+            <button class="x" aria-label="Close">×</button>
+            <h1>Infuse</h1>
+            <label>Code (from editor-app)</label>
+            <input class="code" type="text" placeholder="e.g. X7K2M9" maxlength="8"
+                   autocomplete="off" autocapitalize="characters" spellcheck="false">
+            <button class="act connect">Connect</button>
+            <button class="act disconnect" hidden>Disconnect</button>
+            <div class="status"><span class="dot"></span><span class="text">Not connected</span></div>
+        </div>
+    `;
+
+    document.documentElement.appendChild(panelHost);
+
+    panelEl = {
+        sheet: panelRoot.querySelector('.sheet'),
+        code: panelRoot.querySelector('.code'),
+        connect: panelRoot.querySelector('.connect'),
+        disconnect: panelRoot.querySelector('.disconnect'),
+        dot: panelRoot.querySelector('.dot'),
+        text: panelRoot.querySelector('.text'),
+    };
+
+    /* Slide it in on the next frame, so the transition actually runs.
+       The timer behind it is not decoration: a page that is not being
+       painted (a background tab, a window behind another) never fires
+       requestAnimationFrame at all, and the panel would sit forever just
+       above the top of the screen — built, but invisible. Adding the class
+       twice costs nothing. */
+    const revealPanel = () => panelHost && panelHost.classList.add('open');
+    requestAnimationFrame(revealPanel);
+    setTimeout(revealPanel, 60);
+
+    /* ---------- what the popup does, done here ---------- */
+
+    panelRoot.querySelector('.x').addEventListener('click', closePanel);
+    panelRoot.querySelector('.backdrop').addEventListener('click', closePanel);
+
+    panelEl.code.addEventListener('input', () => {
+        const cleaned = panelEl.code.value.toUpperCase().replace(/\s+/g, '');
+        if (cleaned !== panelEl.code.value) panelEl.code.value = cleaned;
+    });
+
+    panelEl.code.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter') { e.preventDefault(); panelConnect(); }
+        if (e.key === 'Escape') closePanel();
+    });
+
+    panelEl.connect.addEventListener('click', panelConnect);
+    panelEl.disconnect.addEventListener('click', panelDisconnect);
+
+    // fill in whatever background.js already knows
+    try {
+        chrome.runtime.sendMessage({ type: 'getState' }, (response) => {
+            if (chrome.runtime.lastError || !response || !panelEl) return;
+            if (response.pairingCode) panelEl.code.value = response.pairingCode;
+            panelSetStatus(response.isConnected);
+        });
+    } catch {}
+
+    /* No auto-focus, deliberately. On a phone it throws the keyboard up the
+       instant the panel appears, and the browser scrolls to reveal the field
+       — which drags the panel's own head off the top of the screen. The code
+       is already filled in anyway; tapping the field selects it. */
+    panelEl.code.addEventListener('focus', () => panelEl && panelEl.code.select());
+}
+
+/* No tabId is sent: the panel IS the page, so background.js takes the tab
+   the message came from. That is also what makes it right — the page you
+   are looking at is the page that gets connected. */
+function panelConnect() {
+    if (!panelEl) return;
+
+    const code = panelEl.code.value.trim().toUpperCase();
+    if (!code) {
+        panelSetStatus(false, 'Enter a code first');
+        panelEl.code.focus();
+        return;
+    }
+
+    panelEl.connect.disabled = true;
+    panelEl.connect.textContent = 'Connecting…';
+
+    chrome.runtime.sendMessage({ type: 'setCode', code }, () => {
+        if (!panelEl) return;
+
+        panelEl.connect.disabled = false;
+        panelEl.connect.textContent = 'Connect';
+
+        if (chrome.runtime.lastError) {
+            panelSetStatus(false, 'Could not connect');
+            return;
+        }
+
+        panelSetStatus(true, 'Connecting…');
+        setTimeout(closePanel, 700);   // long enough to read it, short enough not to be in the way
+    });
+}
+
+function panelDisconnect() {
+    if (!panelEl) return;
+
+    panelEl.disconnect.disabled = true;
+    panelEl.disconnect.textContent = 'Clearing…';
+
+    chrome.runtime.sendMessage({ type: 'disconnectAndWipe' }, (res) => {
+        if (!panelEl) return;
+        panelEl.disconnect.disabled = false;
+        panelEl.disconnect.textContent = 'Disconnect';
+        panelEl.code.value = '';
+        panelSetStatus(false, res && res.rulesDeleted ? 'Disconnected — page cleared' : 'Disconnected');
+    });
+}
+
+chrome.runtime.onMessage.addListener((message) => {
+    if (message.type === 'togglePanel') {
+        if (panelIsOpen()) closePanel();
+        else openPanel();
+    }
+
+    if (message.type === 'connectionStatusChanged' && panelIsOpen()) {
+        panelSetStatus(message.isConnected);
+    }
+});
+
 /* ============================================================
    ============  N I S J E   E   M E N J E H E R S H M E  ============
    ------------------------------------------------------------
@@ -1387,7 +2108,7 @@ chrome.runtime.sendMessage({ type: 'referenceRequestPersisted' }).catch(() => {}
             }
 
             if (Array.isArray(rule.xpathReplacements) && rule.xpathReplacements.length > 0) {
-                currentXpathRules = rule.xpathReplacements.map((r) => ({ ...r, __resolveFailed: false }));
+                currentXpathRules = rule.xpathReplacements.map((r) => ({ ...r, __resolveFailed: false, __resolveTries: 0 }));
                 reapplyAllXpathRules();
                 startXpathInterval();
             }

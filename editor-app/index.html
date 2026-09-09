@@ -59,6 +59,18 @@
                 <span class="topbar__value topbar__rule" id="active-rule-name">— none —</span>
             </div>
 
+            <button class="btn-toggle" id="refresh-mode-btn" type="button" aria-pressed="false"
+                    title="Refresh mode — while this is on, Apply does not touch the page straight away; the change is stored and lands the moment you refresh that page">
+                <span class="btn-toggle__dot"></span>
+                <span class="btn-toggle__text">Refresh</span>
+            </button>
+
+            <button class="btn-toggle btn-toggle--any" id="any-page-btn" type="button" aria-pressed="false"
+                    title="Any page — while this is on, the change stops belonging to this page's URL: it is stored once and carried by every page, and it only shows up on the ones where the value is really found">
+                <span class="btn-toggle__dot"></span>
+                <span class="btn-toggle__text">Any page</span>
+            </button>
+
             <button class="btn-ghost" id="regen-btn" title="Generate a new code">↻ New code</button>
             <button class="btn-save" id="save-btn">Save</button>
         </header>
@@ -152,9 +164,11 @@
 
                     <div class="ref-body">
                         <div class="ref-preview">
-                            <div class="ref-preview__box">
+                            <div class="ref-preview__box" data-el="ref-box">
                                 <div class="ref-preview-empty" data-el="ref-preview-empty">Nothing found yet — type something above and click "Search"</div>
-                                <iframe data-el="ref-live" title="Live DOM" hidden></iframe>
+                                <div class="ref-preview__stage" data-el="ref-stage">
+                                    <iframe data-el="ref-live" title="Live DOM" hidden></iframe>
+                                </div>
                             </div>
                         </div>
 

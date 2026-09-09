@@ -202,6 +202,67 @@ html, body {
     color: var(--text);
 }
 
+/* ---- REFRESH MODE — the toggle beside "New code" ----
+   Off  = Apply lands on the page straight away (the old behaviour).
+   On   = Apply only stores the change; it lands on the first refresh. */
+.btn-toggle {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    background: transparent;
+    border: 1px solid var(--surface1);
+    color: var(--subtext0);
+    border-radius: 6px;
+    padding: 7px 12px;
+    font-family: var(--font-body);
+    font-size: 0.8rem;
+    cursor: pointer;
+    transition: background 0.15s ease, color 0.15s ease, border-color 0.15s ease;
+}
+
+.btn-toggle:hover {
+    background: var(--surface0);
+    color: var(--text);
+}
+
+/* the header must never squash these two, however narrow it gets */
+.btn-toggle {
+    white-space: nowrap;
+    flex-shrink: 0;
+}
+
+.btn-toggle__dot {
+    width: 9px;
+    height: 9px;
+    border-radius: 50%;
+    background: var(--surface2);
+    flex-shrink: 0;
+    transition: background 0.15s ease, box-shadow 0.15s ease;
+}
+
+.btn-toggle.on {
+    border-color: var(--mauve);
+    color: var(--mauve);
+    background: rgba(202, 158, 230, 0.10);
+}
+
+.btn-toggle.on .btn-toggle__dot {
+    background: var(--mauve);
+    box-shadow: 0 0 6px var(--mauve);
+}
+
+/* ---- ANY PAGE — the same switch, green, for the URL-free mode ---- */
+.btn-toggle--any.on {
+    border-color: var(--green);
+    color: var(--green);
+    background: rgba(166, 209, 137, 0.10);
+}
+
+.btn-toggle--any.on .btn-toggle__dot {
+    background: var(--green);
+    box-shadow: 0 0 6px var(--green);
+}
+
 .btn-save {
     margin-left: auto;
     background: var(--yellow);
@@ -596,10 +657,10 @@ html, body {
     .ref-meta__item--wide { grid-column: span 2; }
 }
 
-/* ---- trupi: imazhi/live majtas, lista djathtas ---- */
+/* ---- trupi: parapamja e TERË faqes siper (tere gjerësia), lista poshtë ---- */
 .ref-body {
     display: grid;
-    grid-template-columns: 1.3fr 1fr;
+    grid-template-columns: 1fr;
     gap: 18px;
     align-items: start;
 }
@@ -613,17 +674,13 @@ html, body {
     overflow: hidden;
 }
 
-@media (max-width: 800px) {
-    .ref-body { grid-template-columns: 1fr; }
-}
-
 .ref-preview__box {
     position: relative;
     background: var(--mantle);
     border: 1px solid var(--surface0);
     border-radius: 8px;
     min-height: 240px;
-    max-height: 420px;
+    max-height: 70vh;
     max-width: 100%;
     overflow: auto;
     display: flex;
@@ -631,12 +688,41 @@ html, body {
     justify-content: center;
 }
 
-#ref-live {
+/* The stage carries the SCALED size of the page. The iframe itself keeps
+   rendering at a full desktop width and is shrunk with a transform, so the
+   layout you see is the real one — just smaller, like a photograph of it. */
+.ref-preview__stage {
+    position: relative;
+    width: 100%;
+    flex: 1;
+    min-width: 0;
+}
+
+.ref-preview__box [data-el="ref-live"] {
     width: 100%;
     min-width: 0;
     min-height: 380px;
     border: none;
     background: #fff;
+    display: block;
+}
+
+/* whole-page mode: the frame is placed by JS (real width + scale) */
+.ref-preview__box--page {
+    justify-content: flex-start;
+    padding: 0;
+}
+
+.ref-preview__box--page .ref-preview__stage {
+    flex: none;
+}
+
+.ref-preview__box--page [data-el="ref-live"] {
+    position: absolute;
+    top: 0;
+    left: 0;
+    min-height: 0;
+    transform-origin: top left;
 }
 
 .ref-preview-empty {

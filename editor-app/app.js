@@ -18,7 +18,14 @@ document.addEventListener('DOMContentLoaded', () => {
     function saveState(partial) {
         const current = loadState();
         const merged = { ...current, ...partial };
-        localStorage.setItem(STORAGE_KEY, JSON.stringify(merged));
+        try {
+            localStorage.setItem(STORAGE_KEY, JSON.stringify(merged));
+        } catch (err) {
+            /* The browser's storage is full, or blocked. It must never take the
+               click you just made down with it — the work stays in memory for
+               this session either way. */
+            console.warn('Infuse — state not stored:', err?.name || err);
+        }
     }
 
     const state = loadState();
@@ -185,12 +192,85 @@ document.addEventListener('DOMContentLoaded', () => {
         reconnectDelay = Math.min(reconnectDelay * 1.5, MAX_RECONNECT_DELAY);
     }
 
+    /* Every 'apply' carries the refresh-mode flag with it. When it is on, the
+       extension stores the change and touches the page with nothing — the
+       change lands by itself the first time that page is refreshed. The
+       read-only requests (reference / referenceRead) are never held back by
+       it; they are questions about the page, not changes to it. */
     function sendUpdate(payload) {
         if (socket && socket.readyState === WebSocket.OPEN) {
-            socket.send(JSON.stringify({ type: 'apply', ...payload }));
+            socket.send(JSON.stringify({
+                type: 'apply',
+                applyOnRefresh: refreshMode,
+                anyPage: anyPageMode,
+                ...payload,
+            }));
             return true;
         }
         return false;
+    }
+
+    /* ============================================
+       1.2 REFRESH MODE — the toggle beside "New code"
+       --------------------------------------------
+       OFF (default) — Apply behaves exactly as it always has: the change
+                       lands on the page the moment you press it.
+       ON            — Apply only stores the change and leaves the page as
+                       it is; it lands by itself, straight away, the first
+                       time that page is refreshed.
+    ============================================ */
+    const refreshModeBtn = document.getElementById('refresh-mode-btn');
+
+    let refreshMode = state.refreshMode === true;
+
+    function renderRefreshMode() {
+        refreshModeBtn.classList.toggle('on', refreshMode);
+        refreshModeBtn.setAttribute('aria-pressed', refreshMode ? 'true' : 'false');
+    }
+
+    renderRefreshMode();
+
+    refreshModeBtn.addEventListener('click', () => {
+        refreshMode = !refreshMode;
+        saveState({ refreshMode });
+        renderRefreshMode();
+    });
+
+    /* ============================================
+       1.3 ANY PAGE — the toggle beside "Refresh"
+       --------------------------------------------
+       OFF (default) — the change belongs to the page you are connected to,
+                       and to that page only.
+       ON            — the URL is dropped altogether. The change is stored
+                       once, with no address at all, and every page carries
+                       it: the tabs already open and every one opened later.
+                       It only ever shows on the pages where the value is
+                       really found — a page that does not have it is left
+                       exactly as it was.
+    ============================================ */
+    const anyPageBtn = document.getElementById('any-page-btn');
+
+    let anyPageMode = state.anyPage === true;
+
+    function renderAnyPage() {
+        anyPageBtn.classList.toggle('on', anyPageMode);
+        anyPageBtn.setAttribute('aria-pressed', anyPageMode ? 'true' : 'false');
+    }
+
+    renderAnyPage();
+
+    anyPageBtn.addEventListener('click', () => {
+        anyPageMode = !anyPageMode;
+        saveState({ anyPage: anyPageMode });
+        renderAnyPage();
+    });
+
+    // what an Apply/Save button should say once the change has gone out
+    function sentLabel(wasSent, doneText) {
+        if (!wasSent) return 'Not connected ✗';
+        if (refreshMode) return 'On refresh ⟳';
+        if (anyPageMode) return 'All pages ✓';
+        return doneText;
     }
 
     /* ============================================
@@ -350,7 +430,7 @@ document.addEventListener('DOMContentLoaded', () => {
         const wasSent = sendUpdate(payload);
         console.log(wasSent ? 'Sent to extension:' : 'NOT sent (no connection yet):', payload);
 
-        saveBtn.textContent = wasSent ? 'Saved ✓' : 'Not connected ✗';
+        saveBtn.textContent = sentLabel(wasSent, 'Saved ✓');
         saveBtn.classList.add('saved');
         setTimeout(() => {
             saveBtn.textContent = 'Save';
@@ -465,7 +545,7 @@ document.addEventListener('DOMContentLoaded', () => {
         const wasSent = sendUpdate({ replacements: validRules });
         console.log(wasSent ? 'Sent replacements to extension:' : 'NOT sent (no connection yet):', validRules);
 
-        applyBtn.textContent = wasSent ? 'Applied ✓' : 'Not connected ✗';
+        applyBtn.textContent = sentLabel(wasSent, 'Applied ✓');
         applyBtn.classList.add('saved');
         setTimeout(() => {
             applyBtn.textContent = 'Apply';
@@ -504,6 +584,15 @@ document.addEventListener('DOMContentLoaded', () => {
     function handleXpathRuleResolved(index, xpath) {
         if (!xpathRules[index]) return;
 
+        /* In "any page" mode a path found on one page is worthless on the
+           next one, so it is never stored: the rule keeps looking by value,
+           and every page finds its own element. */
+        if (anyPageMode) {
+            pendingXpathIndexes.delete(index);
+            renderXpathRules();
+            return;
+        }
+
         // 1. Update the state with the new XPath
         xpathRules[index].xpath = xpath;
         pendingXpathIndexes.delete(index);
@@ -521,7 +610,7 @@ document.addEventListener('DOMContentLoaded', () => {
             console.log('Auto-sent updated xpath rules to extension:', validRules);
             // Optional: you could also make the button pulse green "Applied ✓"
             // for visual feedback without clicking it yourself.
-            applyXpathBtn.textContent = 'Applied ✓';
+            applyXpathBtn.textContent = sentLabel(true, 'Applied ✓');
             applyXpathBtn.classList.add('saved');
             setTimeout(() => {
                 applyXpathBtn.textContent = 'Apply';
@@ -540,9 +629,17 @@ document.addEventListener('DOMContentLoaded', () => {
             const rowEl = document.createElement('div');
             rowEl.className = 'replace-row';
 
+            /* In refresh mode nothing searches while you press Apply — the page
+               itself finds the path when it reloads. Saying "on Apply" there
+               only makes you wait for something that is never going to happen
+               until you refresh. */
             const pathText = row.xpath
                 ? escapeHtml(row.xpath)
-                : (pendingXpathIndexes.has(index) ? 'Searching…' : 'Not found yet — it will be found on Apply');
+                : (pendingXpathIndexes.has(index)
+                    ? 'Searching…'
+                    : (refreshMode
+                        ? 'Not found yet — it will be found when the page is refreshed'
+                        : 'Not found yet — it will be found on Apply'));
 
             rowEl.innerHTML = `
                 <div class="replace-row__field">
@@ -625,7 +722,9 @@ document.addEventListener('DOMContentLoaded', () => {
 
         // mark "searching..." right away on rows that have no xpath yet — this
         // way you see the first click started it, instead of needing 2 clicks
-        if (wasSent) {
+        // in refresh mode nothing searches yet — the page itself resolves the
+        // path when it reloads, so there is no reply to wait for
+        if (wasSent && !refreshMode) {
             xpathRules.forEach((r, i) => {
                 if (!r.xpath && r.find.trim() !== '') {
                     pendingXpathIndexes.add(i);
@@ -634,7 +733,7 @@ document.addEventListener('DOMContentLoaded', () => {
             renderXpathRules();
         }
 
-        applyXpathBtn.textContent = wasSent ? 'Applied ✓' : 'Not connected ✗';
+        applyXpathBtn.textContent = sentLabel(wasSent, 'Applied ✓');
         applyXpathBtn.classList.add('saved');
         setTimeout(() => {
             applyXpathBtn.textContent = 'Apply';
@@ -722,6 +821,8 @@ document.addEventListener('DOMContentLoaded', () => {
         const refStatusEl     = root.querySelector('[data-el="ref-status"]');
 
         const refLiveFrame    = root.querySelector('[data-el="ref-live"]');
+        const refBox          = root.querySelector('[data-el="ref-box"]');
+        const refStage        = root.querySelector('[data-el="ref-stage"]');
         const refPreviewEmpty = root.querySelector('[data-el="ref-preview-empty"]');
 
         const refMetaTag      = root.querySelector('[data-el="ref-meta-tag"]');
@@ -1010,13 +1111,155 @@ document.addEventListener('DOMContentLoaded', () => {
             return { open, close };
         }
 
+        /* ---------- 7.3b THE WHOLE PAGE — a picture of the page, not of the element ----------
+           The extension now sends the entire page along with the element, and the
+           element carries a mark. So the preview shows the page exactly as it
+           stands — the whole width of it — and draws the lilac outline around
+           the ONE object you picked, so you see at a glance where it sits.
+
+           The page is laid out at a real desktop width and the frame is then
+           shrunk to fit the box, like a photograph: the proportions stay true,
+           nothing reflows into a phone layout.
+           ---------------------------------------------------------------- */
+        const REF_PAGE_WIDTH  = 1280;    // the width the page is laid out at
+        const REF_PAGE_MAX_H  = 12000;   // never build a stage taller than this
+        const REF_TARGET_MARK = 'data-le-ref-target';
+
+        let refPageTimer = null;
+        let refFitTimer  = null;
+
+        function refSchedulePagePreview() {
+            clearTimeout(refPageTimer);
+            refPageTimer = setTimeout(refRenderPagePreview, 120);
+        }
+
+        // back to the old element-only preview (no page came with the snapshot)
+        function refClearPageMode() {
+            refBox.classList.remove('ref-preview__box--page');
+            refStage.style.width = '';
+            refStage.style.height = '';
+            refLiveFrame.style.width = '';
+            refLiveFrame.style.height = '';
+            refLiveFrame.style.transform = '';
+        }
+
+        function refRenderPagePreview() {
+            if (!refSnapshot || !refSnapshot.page) return;
+
+            refPreviewEmpty.hidden = true;
+            refLiveFrame.hidden = false;
+            refBox.classList.add('ref-preview__box--page');
+
+            let html = refSnapshot.page;
+
+            try {
+                const doc = new DOMParser().parseFromString(html, 'text/html');
+                const head = doc.head || doc.documentElement;
+                const target = doc.querySelector('[' + REF_TARGET_MARK + ']');
+
+                // every relative image and stylesheet still has to resolve
+                if (refSnapshot.baseHref) {
+                    const base = doc.createElement('base');
+                    base.setAttribute('href', refSnapshot.baseHref);
+                    head.insertBefore(base, head.firstChild);
+                }
+
+                // the edits you have switched on, shown before Apply — as ever
+                if (target) refApplyEditsToClone(doc, target);
+
+                const style = doc.createElement('style');
+                style.textContent =
+                    'html{overflow-x:hidden!important;}' +
+                    '[' + REF_TARGET_MARK + ']{' +
+                        'outline:3px solid #ca9ee6!important;' +
+                        'outline-offset:2px!important;' +
+                        'box-shadow:0 0 0 3px rgba(202,158,230,.45),0 0 0 9999px rgba(35,38,52,.38)!important;' +
+                        'position:relative!important;' +
+                        'z-index:2147483646!important;' +
+                        'animation:leRefPulse 1.4s ease-in-out 4;' +
+                    '}' +
+                    '@keyframes leRefPulse{0%,100%{outline-color:#ca9ee6;}50%{outline-color:#f4b8e4;}}';
+                head.appendChild(style);
+
+                html = '<!DOCTYPE html>' + doc.documentElement.outerHTML;
+            } catch (err) {
+                console.error('[LiveEditor REF] whole-page preview failed:', err);
+            }
+
+            refLiveFrame.onload = () => refFitPagePreview(true);
+            refLiveFrame.srcdoc = html;
+        }
+
+        /* Lay it out at REF_PAGE_WIDTH, shrink the frame to the width of the box,
+           and give the stage the SCALED size — the box then scrolls over a true
+           picture of the page. */
+        function refFitPagePreview(scrollToTarget) {
+            if (!refBox.classList.contains('ref-preview__box--page')) return;
+
+            const boxWidth = refBox.clientWidth || REF_PAGE_WIDTH;
+            const scale = Math.min(1, boxWidth / REF_PAGE_WIDTH);
+
+            // the width goes FIRST: the page has to be measured at the width it
+            // will really be shown at, or every vh/% height comes out wrong
+            refLiveFrame.style.width = REF_PAGE_WIDTH + 'px';
+            refLiveFrame.style.transform = 'scale(' + scale + ')';
+
+            let pageHeight = 0;
+            try {
+                const d = refLiveFrame.contentDocument;
+                pageHeight = d ? Math.max(
+                    d.documentElement.scrollHeight,
+                    d.body ? d.body.scrollHeight : 0
+                ) : 0;
+            } catch {}
+
+            const height = Math.min(Math.max(pageHeight, 400), REF_PAGE_MAX_H);
+
+            refLiveFrame.style.height = height + 'px';
+            refStage.style.width  = Math.round(REF_PAGE_WIDTH * scale) + 'px';
+            refStage.style.height = Math.round(height * scale) + 'px';
+
+            if (scrollToTarget) {
+                // open it right where the marked object is
+                try {
+                    const el = refLiveFrame.contentDocument.querySelector('[' + REF_TARGET_MARK + ']');
+                    if (el) {
+                        const top = el.getBoundingClientRect().top
+                            + (refLiveFrame.contentWindow.scrollY || 0);
+                        refBox.scrollTop = Math.max(0, (top * scale) - (refBox.clientHeight / 3));
+                    }
+                } catch {}
+
+                // images and fonts land late and change the height — measure again
+                clearTimeout(refFitTimer);
+                refFitTimer = setTimeout(() => refFitPagePreview(false), 400);
+            }
+        }
+
+        // the box changes width with the window; the stage is sized in pixels
+        window.addEventListener('resize', () => {
+            clearTimeout(refFitTimer);
+            refFitTimer = setTimeout(() => refFitPagePreview(false), 150);
+        });
+
         function refRebuildLivePreview() {
             if (!refSnapshot || !refSnapshot.html) {
                 refLiveFrame.removeAttribute('srcdoc');
                 refLiveFrame.hidden = true;
                 refPreviewEmpty.hidden = false;
+                refClearPageMode();
                 return;
             }
+
+            /* The whole page, whenever the extension managed to send it — which
+               is always, unless the page was far too big to carry. Otherwise the
+               old element-only preview below takes over. */
+            if (refSnapshot.page) {
+                refSchedulePagePreview();
+                return;
+            }
+
+            refClearPageMode();
             refPreviewEmpty.hidden = true;
             refLiveFrame.hidden = false;
 
@@ -1291,14 +1534,21 @@ document.addEventListener('DOMContentLoaded', () => {
             const wasSent = sendUpdate({ referenceEdits: payload });
             console.log(wasSent ? 'Sent reference edits:' : 'NOT sent (no connection yet):', payload);
 
-            refApplyBtn.textContent = wasSent ? 'Applied ✓' : 'Not connected ✗';
+            refApplyBtn.textContent = sentLabel(wasSent, 'Applied ✓');
             refApplyBtn.classList.add('saved');
             setTimeout(() => {
                 refApplyBtn.textContent = 'Apply';
                 refApplyBtn.classList.remove('saved');
             }, 1200);
 
-            if (wasSent) refSetStatus(`Sent ${payload.length} paths`, 'ok');
+            if (wasSent) {
+                refSetStatus(
+                    refreshMode
+                        ? `Stored ${payload.length} paths — they land on the next refresh`
+                        : `Sent ${payload.length} paths`,
+                    'ok'
+                );
+            }
         });
 
         /* ---------- 7.6 Create new — copies the element (with the selected
@@ -1346,7 +1596,7 @@ document.addEventListener('DOMContentLoaded', () => {
             });
             console.log(wasSent ? 'Sent reference clones:' : 'NOT sent (no connection yet):', refClones);
 
-            refCreateBtn.textContent = wasSent ? 'Created ✓' : 'Not connected ✗';
+            refCreateBtn.textContent = sentLabel(wasSent, 'Created ✓');
             refCreateBtn.classList.add('saved');
             setTimeout(() => {
                 refCreateBtn.textContent = 'Create new';
@@ -1407,12 +1657,18 @@ document.addEventListener('DOMContentLoaded', () => {
                 if (rm) rm.hidden = (n === 1);   // the first one cannot be removed
             },
             getInit() {
+                /* The snapshot now carries the WHOLE page with it — far too much
+                   to keep in storage, and it would blow the quota once every
+                   rule keeps one. Only the small element snapshot is stored (the
+                   fallback preview needs it); the page comes back with the next
+                   Search. */
+                const light = refSnapshot ? { ...refSnapshot, page: null } : null;
                 return {
                     find: refFindInput.value,
                     occurrence: refOccInput.value === '' ? null : parseInt(refOccInput.value, 10),
                     xpath: refXpath,
                     items: refItems,
-                    snapshot: refSnapshot,
+                    snapshot: light,
                 };
             },
             getItems() { return refItems; },
@@ -1530,7 +1786,9 @@ document.addEventListener('DOMContentLoaded', () => {
 
         if (silent) return wasSent;
 
-        applyAllBtn.textContent = wasSent ? 'APPLIED ✓' : 'NO CONNECTION ✗';
+        applyAllBtn.textContent = wasSent
+            ? (refreshMode ? 'ON REFRESH ⟳' : (anyPageMode ? 'ALL PAGES ✓' : 'APPLIED ✓'))
+            : 'NO CONNECTION ✗';
         applyAllBtn.classList.add('saved');
         setTimeout(() => {
             applyAllBtn.textContent = 'APPLY ALL';
@@ -1585,31 +1843,150 @@ document.addEventListener('DOMContentLoaded', () => {
         activeRuleEl.textContent = r ? (r.name || r.pattern) : '— none —';
     }
 
-    // loads a stored rule INTO all 3 views
-    function loadRuleIntoViews(rule) {
-        if (!rule) return;
+    /* ============================================
+       8.1 WORKSPACES — every rule keeps a bench of its own
+       --------------------------------------------
+       A rule is not only what has been applied to a page. It is also
+       everything you have OPEN while working on it: the JS and CSS in the
+       editors, the Replacement rows, the XPath rows, the reference panels
+       and every edit switched on inside them.
 
-        document.getElementById('editor-js').value  = rule.js  || '';
-        document.getElementById('editor-css').value = rule.css || '';
-        editors.forEach(({ textarea, lines, hl, key }) => { updateLineNumbers(textarea, lines); highlight(textarea, hl, key); });
-        saveState({ js: rule.js || '', css: rule.css || '' });
+       All of that used to live in ONE place, shared by every rule. So one
+       rule's 100 -> 200 was the same 100 -> 200 you saw under every other
+       rule, "Clear" emptied them all at once, and the next Apply wrote those
+       borrowed values into whichever page happened to be connected.
 
-        replacements = (rule.replacements && rule.replacements.length)
-            ? JSON.parse(JSON.stringify(rule.replacements))
+       Now each rule has its own bench, kept under its id: leaving a rule
+       packs its bench away, opening one unpacks its own — untouched.
+    ============================================ */
+
+    function deepCopy(value, fallback) {
+        try {
+            return JSON.parse(JSON.stringify(value));
+        } catch {
+            return fallback;
+        }
+    }
+
+    // everything that is on screen right now, as it stands
+    function captureWorkspace() {
+        return {
+            js:  document.getElementById('editor-js').value,
+            css: document.getElementById('editor-css').value,
+            replacements: deepCopy(replacements, []),
+            xpathRules:   deepCopy(xpathRules, []),
+            refEdits:     deepCopy(refEdits, {}),
+            refClones:    deepCopy(refClones, []),
+            /* the found paths are worth keeping; the pictures are not — they
+               are rebuilt by the next Search, and storing one per rule would
+               eat the whole storage quota */
+            refPanelsState: refPanels.map((p) => ({ ...p.getInit(), snapshot: null })),
+        };
+    }
+
+    /* A rule opened for the very first time has no bench yet — it is laid out
+       from what the extension has stored for it, so nothing that was already
+       applied to that page is lost the moment you touch it. */
+    function workspaceFromRule(rule) {
+        const edits = {};
+        (rule.referenceEdits || []).forEach((e) => {
+            if (!e || !e.key) return;
+            edits[e.key] = {
+                enabled: e.value !== null && e.value !== undefined,
+                value: e.value ?? '',
+                color: e.color || '',
+                bgColor: e.bgColor || '',
+            };
+        });
+
+        return {
+            js:  rule.js  || '',
+            css: rule.css || '',
+            replacements: (rule.replacements && rule.replacements.length)
+                ? deepCopy(rule.replacements, [])
+                : [{ find: '', value: '', occurrence: null }],
+            xpathRules: (rule.xpathReplacements && rule.xpathReplacements.length)
+                ? deepCopy(rule.xpathReplacements, [])
+                : [{ find: '', value: '', occurrence: null, xpath: null }],
+            refEdits: edits,
+            refClones: deepCopy(rule.referenceClones || [], []),
+            refPanelsState: [],
+        };
+    }
+
+    function saveWorkspace(ruleId) {
+        if (!ruleId) return;
+        const all = { ...(loadState().workspaces || {}) };
+        all[ruleId] = captureWorkspace();
+        saveState({ workspaces: all });
+    }
+
+    function loadWorkspace(ws) {
+        // 1) the editors
+        document.getElementById('editor-js').value  = ws.js  || '';
+        document.getElementById('editor-css').value = ws.css || '';
+        editors.forEach(({ textarea, lines, hl, key }) => {
+            updateLineNumbers(textarea, lines);
+            highlight(textarea, hl, key);
+        });
+
+        // 2) Replacement + XPath
+        replacements = (ws.replacements && ws.replacements.length)
+            ? ws.replacements
             : [{ find: '', value: '', occurrence: null }];
         saveReplacements();
         renderReplacements();
 
-        xpathRules = (rule.xpathReplacements && rule.xpathReplacements.length)
-            ? JSON.parse(JSON.stringify(rule.xpathReplacements))
+        xpathRules = (ws.xpathRules && ws.xpathRules.length)
+            ? ws.xpathRules
             : [{ find: '', value: '', occurrence: null, xpath: null }];
         saveXpathRules();
         renderXpathRules();
 
-        refClones = rule.referenceClones ? JSON.parse(JSON.stringify(rule.referenceClones)) : [];
-        saveState({ refClones });
+        // 3) the references — the edits AND the panels they belong to
+        refEdits  = ws.refEdits  || {};
+        refClones = ws.refClones || [];
+        rebuildRefPanels(ws.refPanelsState);
+
+        // 4) the live keys follow what is now on screen
+        saveState({
+            js: ws.js || '',
+            css: ws.css || '',
+            refEdits,
+            refClones,
+        });
+        persistPanels();
+    }
+
+    // throw away the panels on screen and lay out this rule's own
+    function rebuildRefPanels(panelsState) {
+        refPanels.slice().forEach((panel) => {
+            try { panel.root.remove(); } catch {}
+        });
+        refPanels.length = 0;
+        activeRefPanel = null;
+        refPanelsHost.innerHTML = '';
+
+        const list = (Array.isArray(panelsState) && panelsState.length) ? panelsState : [{}];
+        list.forEach((init) => addRefPanel(init));
+        refPanels.forEach((p) => p.refresh());
+    }
+
+    /* The one door in and out of a rule. Nothing else may set activeRuleId,
+       or a bench would be left open under the wrong name. */
+    function switchToRule(ruleId) {
+        if (!ruleId || ruleId === activeRuleId) return;
+
+        saveWorkspace(activeRuleId);   // pack away what is open now
+
+        activeRuleId = ruleId;
+        saveState({ activeRuleId });
+
+        const stored = (loadState().workspaces || {})[ruleId];
+        loadWorkspace(stored || workspaceFromRule(ruleById(ruleId) || {}));
 
         setActiveRuleLabel();
+        renderRules();
     }
 
     function renderRules() {
@@ -1663,6 +2040,12 @@ document.addEventListener('DOMContentLoaded', () => {
             removeEl.addEventListener('click', (e) => {
                 e.stopPropagation();
                 rules = rules.filter((r) => r.id !== rule.id);
+
+                // its bench goes with it — nothing left behind to grow forever
+                const benches = { ...(loadState().workspaces || {}) };
+                delete benches[rule.id];
+                saveState({ workspaces: benches });
+
                 if (activeRuleId === rule.id) {
                     activeRuleId = null;
                     saveState({ activeRuleId: null });
@@ -1673,10 +2056,7 @@ document.addEventListener('DOMContentLoaded', () => {
             });
 
             mainEl.addEventListener('click', () => {
-                activeRuleId = rule.id;
-                saveState({ activeRuleId });
-                loadRuleIntoViews(rule);
-                renderRules();
+                switchToRule(rule.id);
             });
 
             rulesListEl.appendChild(row);
@@ -1686,7 +2066,7 @@ document.addEventListener('DOMContentLoaded', () => {
     // sends the full list to the extension (which stores it permanently)
     function pushRules() {
         if (socket && socket.readyState === WebSocket.OPEN) {
-            socket.send(JSON.stringify({ type: 'saveRules', rules }));
+            socket.send(JSON.stringify({ type: 'saveRules', rules, applyOnRefresh: refreshMode }));
             return true;
         }
         return false;
@@ -1710,12 +2090,14 @@ document.addEventListener('DOMContentLoaded', () => {
 
     // replies from the extension
     function handleRulesList(msg) {
+        const previousUrl = lastTargetUrl;
+
         rules = Array.isArray(msg.rules) ? msg.rules : [];
         lastTargetUrl = msg.targetUrl || '';
 
         // AUTOMATIC: pick by itself the rule that belongs to the connected page
         if (lastTargetUrl) {
-            const match = rules.find((r) => {
+            const covers = (r) => {
                 try {
                     const rx = new RegExp('^' + String(r.pattern || '')
                         .replace(/[.+?^${}()|[\]\\]/g, '\\$&')
@@ -1724,10 +2106,21 @@ document.addEventListener('DOMContentLoaded', () => {
                 } catch {
                     return false;
                 }
-            });
-            if (match) {
-                activeRuleId = match.id;
-                saveState({ activeRuleId });
+            };
+
+            /* The URL-free rule ('*') matches every address there is, so on
+               its own it would always win. The page's OWN rule comes first;
+               the URL-free one only stands in when the page has none. */
+            const isAnyPage = (r) => String(r.pattern || '').trim() === '*';
+            const match = rules.find((r) => !isAnyPage(r) && covers(r))
+                || rules.find((r) => isAnyPage(r) && covers(r));
+
+            /* Follow the connected page ONLY when it has actually changed
+               (or when no rule is open yet). This list arrives after every
+               single Apply, and re-selecting on each of them would drag you
+               off whichever rule you had deliberately opened. */
+            if (match && (!activeRuleId || lastTargetUrl !== previousUrl)) {
+                switchToRule(match.id);
             }
         }
 

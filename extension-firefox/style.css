@@ -134,3 +134,65 @@ label {
     background: var(--green);
     box-shadow: 0 0 6px var(--green);
 }
+
+/* ============================================================
+   ANDROID — the popup is a whole SCREEN, not a panel
+   ------------------------------------------------------------
+   Firefox for Android has no anchored dropdown: tapping the icon opens
+   this very document as a full page. There is no manifest key and no API
+   that changes that, so instead of a small panel floating in the corner of
+   an empty screen, it is built as a sheet that hangs from the top of it —
+   as close to the desktop dropdown as the platform allows.
+
+   Desktop is left exactly as it was: its popup viewport really is 300px
+   wide and its pointer is fine, so it matches neither condition below.
+   ============================================================ */
+@media (pointer: coarse), (min-width: 420px) {
+    body {
+        width: 100%;
+        min-height: 100vh;
+        background: var(--crust);
+    }
+
+    .main {
+        width: 100%;
+        padding: 24px 22px 28px;
+        background: var(--base);
+        border-radius: 0 0 18px 18px;
+        border-bottom: 1px solid var(--surface0);
+        box-shadow: 0 12px 32px rgba(0, 0, 0, 0.35);
+    }
+
+    h1 {
+        font-size: 2rem;
+        margin-bottom: 1.7rem;
+    }
+
+    label {
+        font-size: 0.85rem;
+    }
+
+    /* a finger is not a mouse pointer — nothing here is under 48px tall */
+    #code-input {
+        font-size: 1.35rem;
+        padding: 15px 16px;
+        border-radius: 10px;
+    }
+
+    .copy-btn {
+        margin-top: 14px;
+        padding: 15px 16px;
+        font-size: 1rem;
+        border-radius: 10px;
+    }
+
+    .status-row {
+        margin-top: 20px;
+        font-size: 0.95rem;
+    }
+
+    .status-dot {
+        width: 11px;
+        height: 11px;
+    }
+}

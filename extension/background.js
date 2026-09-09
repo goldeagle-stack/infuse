@@ -183,13 +183,64 @@ function urlToPattern(url) {
     }
 }
 
+/* ============================================================
+   ANY PAGE — the rule that belongs to no URL at all
+   ------------------------------------------------------------
+   The editor's header has a second toggle. While it is on, a change is
+   not tied to the page you are connected to: it goes into ONE rule whose
+   pattern is '*', which matches every page there is.
+
+   content-script.js reads the rules itself at 'document_start', so from
+   then on EVERY page you open carries it — and it only ever shows on the
+   pages where the value is really found; the rest are left untouched.
+   Nothing about it needs a connected page, so all the tabs you already
+   have open are covered too.
+
+   Every place that looks up "this page's rule" skips it on purpose
+   (isAnyPageRule) — otherwise the URL-free rule, which matches everything,
+   would swallow the changes meant for one single page.
+   ============================================================ */
+const ANY_PAGE_PATTERN = '*';
+const ANY_PAGE_RULE_ID = 'rule-any-page';
+
+function isAnyPageRule(rule) {
+    return !!rule && (rule.id === ANY_PAGE_RULE_ID
+        || String(rule.pattern || '').trim() === ANY_PAGE_PATTERN);
+}
+
+async function updateAnyPageRule(patch) {
+    const rules = await getRules();
+    let rule = rules.find(isAnyPageRule);
+
+    if (!rule) {
+        rule = {
+            id: ANY_PAGE_RULE_ID,
+            name: 'Any page',
+            pattern: ANY_PAGE_PATTERN,
+            enabled: true,
+            js: '',
+            css: '',
+            replacements: [],
+            xpathReplacements: [],
+            referenceEdits: [],
+            referenceClones: [],
+        };
+        rules.push(rule);
+        console.log('Infuse — any-page rule created (no URL at all)');
+    }
+
+    Object.assign(rule, patch);
+    await setRules(rules);
+    return rule;
+}
+
 // AUTOMATIC: as soon as you connect to a page, a rule for it is created by itself
 // (when no matching one exists yet) — no button, no questions
 async function ensureRuleForUrl(url) {
     if (!url || /^(about|chrome|moz-extension|chrome-extension):/i.test(url)) return null;
 
     const rules = await getRules();
-    const existing = rules.find((r) => urlMatchesPattern(url, r.pattern));
+    const existing = rules.find((r) => !isAnyPageRule(r) && urlMatchesPattern(url, r.pattern));
     if (existing) return existing;
 
     let name = '';
@@ -225,7 +276,7 @@ async function updateRuleForUrl(url, patch) {
     if (!url) return;
 
     const rules = await getRules();
-    let rule = rules.find((r) => urlMatchesPattern(url, r.pattern));
+    let rule = rules.find((r) => !isAnyPageRule(r) && urlMatchesPattern(url, r.pattern));
 
     if (!rule) {
         rule = await ensureRuleForUrl(url);
@@ -240,6 +291,37 @@ async function updateRuleForUrl(url, patch) {
 
     Object.assign(rule, patch);
     await setRules(rules);
+}
+
+/* A path the page has just worked out is written straight into its rule, so
+   the NEXT visit never searches for it again: it takes the fast route and the
+   value lands as the element is parsed. Until now this only happened when the
+   editor was open to relay it back, which meant every plain visit paid for a
+   full-document search all over again.
+
+   The URL-free rule is left alone on purpose — a path found on one page means
+   nothing on the next one. */
+async function pinXpathInRule(url, index, xpath) {
+    if (!url || !xpath) return;
+
+    const rules = await getRules();
+    let changed = false;
+
+    rules.forEach((rule) => {
+        if (isAnyPageRule(rule)) return;
+        if (!urlMatchesPattern(url, rule.pattern)) return;
+
+        const list = rule.xpathReplacements;
+        if (!Array.isArray(list) || list.length === 0) return;
+
+        const entry = list.find((r) => r && r.index === index) || list[index];
+        if (!entry || entry.xpath === xpath) return;
+
+        entry.xpath = xpath;
+        changed = true;
+    });
+
+    if (changed) await setRules(rules);
 }
 
 // applies a single rule to one tab
@@ -303,6 +385,31 @@ function applyRuleToTab(tabId, rule, labelPrefix) {
             label('referenceClones')
         );
     }
+}
+
+/* The pages the browser never lets us touch — its own screens, the
+   extension's own pages, the devtools. Trying anyway only fills the
+   console with errors. */
+const UNTOUCHABLE_URL = /^(about|chrome|edge|opera|vivaldi|brave|moz-extension|chrome-extension|devtools|view-source|resource|data):/i;
+
+// ANY PAGE: push one rule into every tab that is open right now
+async function applyRuleToEveryTab(rule) {
+    let tabs = [];
+    try {
+        tabs = await chrome.tabs.query({});
+    } catch {
+        return 0;
+    }
+
+    let count = 0;
+    tabs.forEach((tab) => {
+        if (!tab.id || !tab.url || UNTOUCHABLE_URL.test(tab.url)) return;
+        count++;
+        applyRuleToTab(tab.id, rule, 'any page: ');
+    });
+
+    console.log('Infuse — any-page rule pushed into', count, 'open tab(s)');
+    return count;
 }
 
 // applies ALL the rules that match this page
@@ -664,7 +771,18 @@ function scheduleReconnect() {
 
 function setConnectionStatus(isConnected) {
     chrome.storage.local.set({ connectionStatus: isConnected });
+
+    // the popup and the other extension pages
     chrome.runtime.sendMessage({ type: 'connectionStatusChanged', isConnected }).catch(() => {});
+
+    /* The in-page panel is not an extension page — a runtime message never
+       reaches it. It has to be told through its own tab. */
+    getTargetTabId()
+        .then((tabId) => {
+            if (!tabId) return;
+            chrome.tabs.sendMessage(tabId, { type: 'connectionStatusChanged', isConnected }).catch(() => {});
+        })
+        .catch(() => {});
 }
 
 function sendToRelay(payload) {
@@ -722,13 +840,18 @@ async function handleRelayMessage(raw) {
         await setRules(msg.rules);
         console.log('Live Editor — stored', msg.rules.length, 'rule(s)');
 
-        // apply them at once to the target tab (when it matches), so you see it without a refresh
-        const targetTabId = await getTargetTabId();
-        if (targetTabId) {
-            try {
-                const tab = await chrome.tabs.get(targetTabId);
-                if (tab?.url) applyMatchingRulesToTab(targetTabId, tab.url);
-            } catch {}
+        /* Apply them at once to the target tab (when it matches), so you see it
+           without a refresh. In refresh mode we skip exactly this: the rules
+           are stored and nothing else, and content-script.js picks them up by
+           itself at 'document_start' the first time the page is refreshed. */
+        if (!msg.applyOnRefresh) {
+            const targetTabId = await getTargetTabId();
+            if (targetTabId) {
+                try {
+                    const tab = await chrome.tabs.get(targetTabId);
+                    if (tab?.url) applyMatchingRulesToTab(targetTabId, tab.url);
+                } catch {}
+            }
         }
 
         sendToRelay({ type: 'rulesSaved', count: msg.rules.length });
@@ -754,13 +877,35 @@ async function handleRelayMessage(raw) {
 
     if (msg.type !== 'apply') return;
 
+    /* ---------- REFRESH MODE ----------
+       The editor's header has a toggle. While it is on, every change that
+       arrives here is STORED (in the page's rule and in the live session)
+       but nothing is written to the page. content-script.js reads the rules
+       itself at 'document_start', so the whole lot lands at once the first
+       time that page is refreshed.
+
+       Only the two READ requests below ('reference' and 'referenceRead')
+       ignore this — they change nothing, they only answer the editor's
+       questions about the page, and Search would be dead without them. */
+    const applyOnRefreshOnly = msg.applyOnRefresh === true;
+
+    const targetTabId = await getTargetTabId();
+
+    /* ---------- ANY PAGE ----------
+       Takes its own route entirely, because nothing about it belongs to one
+       page: no target tab is needed, and none of the per-page storage below
+       is touched. Everything lands in the single URL-free rule. */
+    if (msg.anyPage === true) {
+        await applyToEveryPage(msg, applyOnRefreshOnly, targetTabId);
+        return;
+    }
+
     // store css/js ONLY when they really arrived (Save) — otherwise a request
     // from Reference/Replacement would wipe them by accident
     if (typeof msg.css === 'string' || typeof msg.js === 'string') {
         await setLastPayload(msg.css, msg.js);
     }
 
-    const targetTabId = await getTargetTabId();
     if (!targetTabId) return;
 
     let tabExists = true;
@@ -793,14 +938,14 @@ async function handleRelayMessage(raw) {
         }
     } catch {}
 
-    if (typeof msg.css === 'string') {
+    if (typeof msg.css === 'string' && !applyOnRefreshOnly) {
         withHostPermissionRetry(
             () => sendToTab(targetTabId, { type: 'applyCSS', css: msg.css }),
             'applyCSS'
         );
     }
 
-    if (typeof msg.js === 'string' && msg.js.trim()) {
+    if (typeof msg.js === 'string' && msg.js.trim() && !applyOnRefreshOnly) {
         withHostPermissionRetry(
             () => chrome.scripting.executeScript({
                 target: { tabId: targetTabId },
@@ -821,7 +966,7 @@ async function handleRelayMessage(raw) {
     if (Array.isArray(msg.replacements)) {
         await setLastReplacements(msg.replacements);
 
-        if (msg.replacements.length > 0) {
+        if (msg.replacements.length > 0 && !applyOnRefreshOnly) {
             withHostPermissionRetry(
                 () => chrome.scripting.executeScript({
                     target: { tabId: targetTabId },
@@ -838,7 +983,7 @@ async function handleRelayMessage(raw) {
     if (Array.isArray(msg.xpathReplacements)) {
         await setLastXpathReplacements(msg.xpathReplacements);
 
-        if (msg.xpathReplacements.length > 0) {
+        if (msg.xpathReplacements.length > 0 && !applyOnRefreshOnly) {
             withHostPermissionRetry(
                 () => sendToTab(targetTabId, { type: 'xpathReplacements', rules: msg.xpathReplacements }),
                 'xpathReplacements'
@@ -865,18 +1010,89 @@ async function handleRelayMessage(raw) {
     // ---------- REFERENCE — the edits, by xpath ----------
     if (Array.isArray(msg.referenceEdits)) {
         await setLastReferenceEdits(msg.referenceEdits);
-        withHostPermissionRetry(
-            () => sendToTab(targetTabId, { type: 'referenceEdits', edits: msg.referenceEdits }),
-            'referenceEdits'
-        );
+
+        if (!applyOnRefreshOnly) {
+            withHostPermissionRetry(
+                () => sendToTab(targetTabId, { type: 'referenceEdits', edits: msg.referenceEdits }),
+                'referenceEdits'
+            );
+        }
     }
 
     // ---------- REFERENCE — the clones ("Create new") ----------
     if (Array.isArray(msg.referenceClones)) {
         await setLastReferenceClones(msg.referenceClones);
+
+        if (!applyOnRefreshOnly) {
+            withHostPermissionRetry(
+                () => sendToTab(targetTabId, { type: 'referenceClones', clones: msg.referenceClones }),
+                'referenceClones'
+            );
+        }
+    }
+}
+
+/* ============================================================
+   ANY PAGE — store it once, with no URL, and let it find its own pages
+   ------------------------------------------------------------
+   1) everything goes into the single '*' rule
+   2) unless refresh mode is on, that rule is pushed straight into every
+      tab that is open right now — all 50 of them if that is what there is
+   3) every page opened later picks it up by itself, at 'document_start'
+
+   The change only ever appears where the value is really found: a page
+   that does not contain it is left exactly as it was.
+   ============================================================ */
+async function applyToEveryPage(msg, applyOnRefreshOnly, targetTabId) {
+    const patch = {};
+
+    if (typeof msg.css === 'string') patch.css = msg.css;
+    if (typeof msg.js === 'string') patch.js = msg.js;
+    if (Array.isArray(msg.replacements)) patch.replacements = msg.replacements;
+
+    /* A path found on one page means nothing on the next one. Stored without
+       it, the rule keeps looking by VALUE, so every page finds its own
+       element — which is the whole point of having no URL. */
+    if (Array.isArray(msg.xpathReplacements)) {
+        patch.xpathReplacements = msg.xpathReplacements.map((r) => ({ ...r, xpath: null }));
+    }
+
+    if (Array.isArray(msg.referenceEdits)) patch.referenceEdits = msg.referenceEdits;
+    if (Array.isArray(msg.referenceClones)) patch.referenceClones = msg.referenceClones;
+
+    if (Object.keys(patch).length > 0) {
+        const rule = await updateAnyPageRule(patch);
+
+        let targetUrl = '';
+        if (targetTabId) {
+            try {
+                const tab = await chrome.tabs.get(targetTabId);
+                targetUrl = tab?.url || '';
+            } catch {}
+        }
+
+        const rules = await getRules();
+        sendToRelay({ type: 'rulesList', rules, targetUrl });
+
+        if (!applyOnRefreshOnly) await applyRuleToEveryTab(rule);
+    }
+
+    /* The two READ requests still need one page to look at — they answer the
+       editor's questions (Search, the arrows) and change nothing at all. With
+       no page connected there is simply nothing to read. */
+    if (!targetTabId) return;
+
+    if (msg.reference) {
         withHostPermissionRetry(
-            () => sendToTab(targetTabId, { type: 'referenceClones', clones: msg.referenceClones }),
-            'referenceClones'
+            () => sendToTab(targetTabId, { type: 'reference', ref: msg.reference }),
+            'reference (any page)'
+        );
+    }
+
+    if (msg.referenceRead) {
+        withHostPermissionRetry(
+            () => sendToTab(targetTabId, { type: 'referenceRead', xpath: msg.referenceRead }),
+            'referenceRead (any page)'
         );
     }
 }
@@ -920,10 +1136,18 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     }
 
     if (message.type === 'setCode') {
-        setStoredCodeAndTab(message.code, message.tabId).then(async () => {
+        /* The popup sends the active tab's id. The in-page panel sends none —
+           it IS the page, so the tab the message came from is the target. */
+        const targetTab = message.tabId ?? sender.tab?.id;
+        if (!targetTab) {
+            sendResponse({ ok: false });
+            return true;
+        }
+
+        setStoredCodeAndTab(message.code, targetTab).then(async () => {
             // AUTOMATIC: create (or find) this page's rule as soon as you connect
             try {
-                const tab = await chrome.tabs.get(message.tabId);
+                const tab = await chrome.tabs.get(targetTab);
                 if (tab?.url) await ensureRuleForUrl(tab.url);
             } catch {}
 
@@ -1043,6 +1267,9 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     }
 
     if (message.type === 'xpathRuleResolved' && sender.tab?.id) {
+        // keep it for good, whether or not the editor is open to hear about it
+        pinXpathInRule(sender.tab.url, message.index, message.xpath);
+
         getTargetTabId().then((targetTabId) => {
             if (sender.tab.id !== targetTabId) return;
             sendToRelay({ type: 'xpathRuleResolved', index: message.index, xpath: message.xpath });
@@ -1124,7 +1351,42 @@ chrome.alarms.onAlarm.addListener(async (alarm) => {
     connectWebSocket();
 });
 
+/* ============================================================
+   ANDROID — the toolbar tap opens a panel INSIDE the page
+   ------------------------------------------------------------
+   Firefox for Android has no anchored popup: it opens popup.html as a
+   whole separate screen, which means leaving the page you are working on
+   just to type a code.
+
+   So on Android the popup is switched off. A browser only fires
+   action.onClicked when there is no popup to open, so the tap arrives
+   here, and we hand it to the content script, which builds the same
+   panel inside the page itself.
+
+   Desktop is untouched: the check below is what keeps its popup. */
+async function useInPagePanelOnAndroid() {
+    try {
+        const info = await chrome.runtime.getPlatformInfo();
+        if (info?.os !== 'android') return;
+        await chrome.action.setPopup({ popup: '' });
+        console.log('Infuse — Android: the panel opens inside the page');
+    } catch {}
+}
+
+chrome.action.onClicked.addListener(async (tab) => {
+    if (!tab?.id) return;
+    try {
+        await sendToTab(tab.id, { type: 'togglePanel' });
+    } catch {
+        /* Pages a content script may never touch (about:, addons.mozilla.org,
+           the store). Nothing can be shown there — and nothing can be edited
+           there either, so there is nothing to say. */
+        console.log('Infuse — no panel on this page:', tab.url);
+    }
+});
+
 /* ---------- Start ---------- */
-chrome.runtime.onInstalled.addListener(() => connectWebSocket());
-chrome.runtime.onStartup.addListener(() => connectWebSocket());
+chrome.runtime.onInstalled.addListener(() => { useInPagePanelOnAndroid(); connectWebSocket(); });
+chrome.runtime.onStartup.addListener(() => { useInPagePanelOnAndroid(); connectWebSocket(); });
+useInPagePanelOnAndroid();
 connectWebSocket();
